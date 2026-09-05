@@ -329,7 +329,7 @@ function checkIpThreatLevel(cf: any): boolean {
   }
 
   // RTTが0の場合は特殊プロキシ/Bot判定
-  if (cf.clientTcpRtt === 0) return true;
+  //if (cf.clientTcpRtt === 0) return true;
 
   const asOrg = cf.asOrganization || "";
   if (
