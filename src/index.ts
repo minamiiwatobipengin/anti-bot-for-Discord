@@ -1,15 +1,5 @@
-export interface Env {
-  DB: D1Database;
-  DISCORD_CLIENT_ID: string;
-  DISCORD_CLIENT_SECRET: string;
-  DISCORD_REDIRECT_URI: string;
-  DISCORD_BOT_TOKEN: string;
-  HCAPTCHA_SECRET: string;
-  HCAPTCHA_SITEKEY: string;
-}
-
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request, env) {
     try {
       const url = new URL(request.url);
 
@@ -56,41 +46,37 @@ export default {
       // 4. データ計測 & Discord へメタデータ送信
       if (url.pathname === "/verify" && request.method === "POST") {
         const formData = await request.formData();
-        const hCaptchaResponse = formData.get("h-captcha-response") as string;
-        const discordId = formData.get("discord_id") as string;
-        const accessToken = formData.get("access_token") as string;
-        const guildId = (formData.get("guild_id") as string) || "global";
+        const hCaptchaResponse = formData.get("h-captcha-response");
+        const discordId = formData.get("discord_id");
+        const accessToken = formData.get("access_token");
+        const guildId = formData.get("guild_id") || "global";
         const clientIp = request.headers.get("cf-connecting-ip") || "";
 
         if (!discordId || !accessToken) {
           return new Response("不正なリクエストパラメータです。", { status: 400 });
         }
 
-        // A. hCaptcha 検証 (例外が発生した場合は安全側「人間未認証 = 0」として扱う)
+        // A. hCaptcha 検証
         let humanVerified = 0;
         if (hCaptchaResponse) {
           const isHuman = await verifyHCaptcha(hCaptchaResponse, env.HCAPTCHA_SECRET);
           if (isHuman) humanVerified = 1;
         }
 
-        // B. IP / VPN / Proxy 検証
-        // 【安全側に倒す】取得エラー・データ不整合時は安全のため vpnClean = 0 (リスクあり) とみなす
+        // B. IP / VPN / Proxy / Tor 検証
         let vpnClean = 0;
         try {
-          const cfProps = (request as any).cf;
-          const isProxyOrBot = checkIpThreatLevel(cfProps);
+          const isProxyOrBotOrTor = checkIpThreatLevel(request);
           const isTsukubaVpn = await checkTsukubaVpn(clientIp);
 
-          // Proxy / Bot / 筑波大学VPNのいずれも検知されなかった場合のみ Clean (1) とする
-          if (!isProxyOrBot && !isTsukubaVpn) {
+          if (!isProxyOrBotOrTor && !isTsukubaVpn) {
             vpnClean = 1;
           }
         } catch (e) {
-          console.error("VPN Check Failed -> Defaulting to Unsafe (Fail-Closed)", e);
-          vpnClean = 0; // エラー時は判定を落とす（安全側）
+          vpnClean = 0;
         }
 
-        // C. サブアカウント数のカウント（D1 取得エラー時は処理を中断）
+        // C. サブアカウント数のカウント
         let subAccountNumber = 1;
         try {
           const existingRecords = await env.DB.prepare(
@@ -101,14 +87,13 @@ export default {
             throw new Error("D1 query returned invalid result.");
           }
 
-          const otherAccounts = existingRecords.results.filter((r: any) => r.discord_id !== discordId);
+          const otherAccounts = existingRecords.results.filter((r) => r.discord_id !== discordId);
           subAccountNumber = otherAccounts.length + 1;
         } catch (e) {
-          console.error("D1 Read Failed -> Aborting Process", e);
           return new Response("データベースエラーが発生したため認証処理を中止しました。", { status: 500 });
         }
 
-        // D. DBの保存・更新（保存失敗時は処理を中断）
+        // D. DBの保存・更新
         const expiresAt = Math.floor(Date.now() / 1000) + 3600;
         try {
           await env.DB.prepare(
@@ -121,11 +106,10 @@ export default {
             accessToken, expiresAt, Math.floor(Date.now() / 1000), clientIp
           ).run();
         } catch (e) {
-          console.error("D1 Write Failed -> Aborting Process", e);
           return new Response("データベースへの保存に失敗したため処理を中止しました。", { status: 500 });
         }
 
-        // E. Discord へ全ステータス（メタデータ）を送信
+        // E. Discord へメタデータ送信
         const updated = await updateRoleConnection(accessToken, {
           human_verified: humanVerified,
           vpn_clean: vpnClean,
@@ -142,17 +126,15 @@ export default {
       }
 
       return Response.redirect(`${url.origin}/privacy`, 302);
-    } catch (fatalError: any) {
-      // 予期せぬクラッシュを捉えて Error 1101 を防ぎ、安全にエラーレスポンスを返す
-      console.error("Unhandled Fatal Exception:", fatalError);
+    } catch (fatalError) {
       return new Response(`システムエラーが発生しました: ${fatalError.message || "Unknown error"}`, { status: 500 });
     }
   }
 };
 
-/* --- メタデータ定義更新 (Discord 連携ロール設定画面用) --- */
+/* --- メタデータ定義更新 --- */
 
-async function handleUpdateMetadata(env: Env): Promise<Response> {
+async function handleUpdateMetadata(env) {
   try {
     const url = `https://discord.com/api/v10/applications/${env.DISCORD_CLIENT_ID}/role-connections/metadata`;
     
@@ -161,19 +143,19 @@ async function handleUpdateMetadata(env: Env): Promise<Response> {
         key: "human_verified",
         name: "人間認証 (hCaptcha) パス",
         description: "Captchaをクリアしているか",
-        type: 7 // BOOLEAN_EQUAL (1 = True)
+        type: 7
       },
       {
         key: "vpn_clean",
-        name: "VPN / Proxy 未使用",
-        description: "VPNや筑波大学VPNを使用していないか",
-        type: 7 // BOOLEAN_EQUAL (1 = True)
+        name: "VPN / Proxy / Tor 未使用",
+        description: "VPN・Tor・プロキシ・筑波大学VPN等を使用していないか",
+        type: 7
       },
       {
         key: "sub_account_number",
         name: "アカウント順位 (サブ垢制限)",
         description: "メイン=1, サブ1=2, サブ2=3... (例: 1以下に設定でメインのみ許可)",
-        type: 6 // NUMBER_LESS_THAN_OR_EQUAL
+        type: 6
       }
     ];
 
@@ -192,14 +174,14 @@ async function handleUpdateMetadata(env: Env): Promise<Response> {
     }
 
     return new Response("Discord Linked Role メタデータ定義を更新しました！", { status: 200 });
-  } catch (e: any) {
+  } catch (e) {
     return new Response(`API通信エラー: ${e.message}`, { status: 500 });
   }
 }
 
 /* --- UI描画 --- */
 
-function renderAuthPage(userId: string, accessToken: string, guildId: string, siteKey: string): Response {
+function renderAuthPage(userId, accessToken, guildId, siteKey) {
   const html = `
     <!DOCTYPE html>
     <html lang="ja">
@@ -240,7 +222,7 @@ function renderAuthPage(userId: string, accessToken: string, guildId: string, si
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-function renderPrivacyPolicy(): Response {
+function renderPrivacyPolicy() {
   const html = `
     <!DOCTYPE html>
     <html lang="ja">
@@ -263,9 +245,9 @@ function renderPrivacyPolicy(): Response {
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-/* --- 外部API通信 & セキュリティ判定（Fail-Closed 適用） --- */
+/* --- 外部API通信 & セキュリティ判定 --- */
 
-async function exchangeCode(code: string, env: Env) {
+async function exchangeCode(code, env) {
   try {
     const params = new URLSearchParams({
       client_id: env.DISCORD_CLIENT_ID,
@@ -282,28 +264,26 @@ async function exchangeCode(code: string, env: Env) {
     });
 
     if (!res.ok) return null;
-    return await res.json() as any;
+    return await res.json();
   } catch (e) {
-    console.error("exchangeCode Failed:", e);
     return null;
   }
 }
 
-async function getDiscordUser(accessToken: string) {
+async function getDiscordUser(accessToken) {
   try {
     const res = await fetch("https://discord.com/api/v10/users/@me", {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
 
     if (!res.ok) return null;
-    return await res.json() as any;
+    return await res.json();
   } catch (e) {
-    console.error("getDiscordUser Failed:", e);
     return null;
   }
 }
 
-async function verifyHCaptcha(token: string, secret: string): Promise<boolean> {
+async function verifyHCaptcha(token, secret) {
   if (!token) return false;
   try {
     const params = new URLSearchParams({ secret, response: token });
@@ -314,49 +294,71 @@ async function verifyHCaptcha(token: string, secret: string): Promise<boolean> {
     });
 
     if (!res.ok) return false;
-    const data = await res.json() as any;
+    const data = await res.json();
     return !!data.success;
   } catch (e) {
-    console.error("verifyHCaptcha Failed:", e);
-    return false; // エラー時は認証失敗とみなす（安全側）
+    return false;
   }
 }
 
-function checkIpThreatLevel(cf: any): boolean {
+function checkIpThreatLevel(request) {
+  const cf = request.cf;
   if (!cf || typeof cf !== "object") {
-    // Cloudflare オブジェクトが取得できない環境（ローカル実行等）は警告として検知（安全側）
     return true; 
   }
 
-  // RTTが0の場合は特殊プロキシ/Bot判定
-  //if (cf.clientTcpRtt === 0) return true;
+  const country = cf.country || "";
+  if (country === "T1" || country === "XX" || cf.botManagement?.isTor || cf.isTor) {
+    return true;
+  }
 
-  const asOrg = cf.asOrganization || "";
-  if (
-    asOrg.includes("DigitalOcean") ||
-    asOrg.includes("AWS") ||
-    asOrg.includes("Hostinger") ||
-    asOrg.includes("M247") ||
-    asOrg.includes("Linode") ||
-    asOrg.includes("Vultr")
-  ) {
-    return true; // ホスティング・プロキシと判断
+  const proxyHeaders = ["via", "x-forwarded-for", "forwarded", "proxy-connection"];
+  for (const header of proxyHeaders) {
+    if (request.headers.has(header)) {
+      const val = request.headers.get(header)?.toLowerCase() || "";
+      if (val.includes("proxy") || val.includes("squid") || val.includes("tor")) {
+        return true;
+      }
+    }
+  }
+
+  const asn = cf.asn ? Number(cf.asn) : 0;
+  const knownVpnAsns = [
+    13335, 14061, 16509, 14618, 15169, 8075, 20473, 63949,
+    46844, 202425, 60068, 9009, 212238, 39572, 51167, 206216
+  ];
+
+  if (knownVpnAsns.includes(asn)) {
+    return true;
+  }
+
+  const asOrg = (cf.asOrganization || "").toLowerCase();
+  const vpnKeywords = [
+    "digitalocean", "aws", "amazon", "hostinger", "m247", "linode", "vultr",
+    "hetzner", "ovh", "choopa", "google", "azure", "fastly", "cloudflare",
+    "nordvpn", "expressvpn", "surfshark", "mullvad", "proton", "cyberghost",
+    "private internet access", "datacenter", "hosting", "proxy", "vpn"
+  ];
+
+  if (vpnKeywords.some(keyword => asOrg.includes(keyword))) {
+    return true;
   }
 
   return false;
 }
 
-async function checkTsukubaVpn(clientIp: string): Promise<boolean> {
-  if (!clientIp) return true; // IPが取れない場合は安全のためブロック扱い
+async function checkTsukubaVpn(clientIp) {
+  if (!clientIp) return true;
 
   try {
-    const res = await fetch("https://www.vpngate.net/api/iphone/", {
-      cf: { cacheTtl: 3600, cacheEverything: true }
-    });
+    // Cloudflareのキャッシュ指定オプションを互換性のある形式に修正
+    const requestOptions = {
+      headers: { "User-Agent": "Cloudflare-Worker" }
+    };
+
+    const res = await fetch("https://www.vpngate.net/api/iphone/", requestOptions);
 
     if (!res.ok) {
-      // 筑波大学APIが落ちている場合は安全側に倒して「VPNチェックでリスクあり」とする
-      console.warn("Tsukuba VPN Gate API returned non-OK status.");
       return true;
     }
 
@@ -367,22 +369,17 @@ async function checkTsukubaVpn(clientIp: string): Promise<boolean> {
       if (line.startsWith("*") || line.startsWith("#") || !line.trim()) continue;
       const parts = line.split(",");
       if (parts.length > 1 && parts[1] === clientIp) {
-        return true; // 筑波大学VPNに一致
+        return true;
       }
     }
 
     return false;
   } catch (e) {
-    console.error("checkTsukubaVpn Failed:", e);
-    return true; // 例外時は安全側に倒す
+    return true;
   }
 }
 
-async function updateRoleConnection(
-  accessToken: string, 
-  metadata: { human_verified: number; vpn_clean: number; sub_account_number: number }, 
-  env: Env
-): Promise<boolean> {
+async function updateRoleConnection(accessToken, metadata, env) {
   try {
     const url = `https://discord.com/api/v10/users/@me/applications/${env.DISCORD_CLIENT_ID}/role-connection`;
     const body = {
@@ -401,7 +398,6 @@ async function updateRoleConnection(
 
     return res.ok;
   } catch (e) {
-    console.error("updateRoleConnection Failed:", e);
     return false;
   }
 }
