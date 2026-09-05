@@ -2,59 +2,120 @@ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
+      const cookies = parseCookies(request.headers.get("Cookie") || "");
 
-      // 0. プライバシーポリシー
+      // 0-1. プライバシーポリシー
       if (url.pathname === "/privacy") {
         return renderPrivacyPolicy();
       }
 
-      // 1. Linked Role メタデータ定義更新 API (認証なし)
+      // 0-2. 利用規約 (新規追加)
+      if (url.pathname === "/terms") {
+        return renderTermsOfService();
+      }
+
+      // 1. Linked Role メタデータ定義更新 API
       if (url.pathname === "/update-metadata") {
         return await handleUpdateMetadata(env);
       }
 
-      // 2. OAuth2 認証開始
+      // 2. OAuth2 認証開始 (CSRF防止用 state の生成と Cookie 設定)
       if (url.pathname === "/login") {
         const guildId = url.searchParams.get("guild_id") || "global";
-        const authUrl = `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_CLIENT_ID}&redirect_uri=${encodeURIComponent(env.DISCORD_REDIRECT_URI)}&response_type=code&scope=identify%20role_connections.write&state=${guildId}`;
-        return Response.redirect(authUrl, 302);
+        const stateToken = crypto.randomUUID();
+        const statePayload = `${guildId}:${stateToken}`;
+
+        const authUrl = `https://discord.com/oauth2/authorize?client_id=${
+          env.DISCORD_CLIENT_ID
+        }&redirect_uri=${encodeURIComponent(
+          env.DISCORD_REDIRECT_URI
+        )}&response_type=code&scope=identify%20role_connections.write&state=${encodeURIComponent(statePayload)}`;
+
+        const response = Response.redirect(authUrl, 302);
+        // CSRF検証用Stateを短期Cookieに保持
+        response.headers.append(
+          "Set-Cookie",
+          `oauth_state=${stateToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
+        );
+        return response;
       }
 
-      // 3. OAuth2 コールバック受取 & 認証画面表示
+      // 3. OAuth2 コールバック受取 & 認証・同意画面表示
       if (url.pathname === "/callback") {
         const code = url.searchParams.get("code");
-        const guildId = url.searchParams.get("state") || "global";
-        if (!code) {
-          return new Response("認証コードが見つかりません。最初からやり直してください。", { status: 400 });
+        const state = url.searchParams.get("state");
+
+        if (!code || !state) {
+          return new Response("認証パラメータが不足しています。", { status: 400 });
         }
 
-        // トークン取得（失敗時は処理中止）
+        // State パラメータの検証 (CSRF対策)
+        const [guildId, stateToken] = state.split(":");
+        const savedState = cookies["oauth_state"];
+
+        if (!savedState || savedState !== stateToken) {
+          return new Response("無効なセッションまたはCSRFトークンの検証に失敗しました。", { status: 403 });
+        }
+
+        // トークン取得
         const tokenData = await exchangeCode(code, env);
         if (!tokenData || !tokenData.access_token) {
-          return new Response("Discordトークンの取得に失敗しました。時間をおいて再試行してください。", { status: 500 });
+          return new Response("Discordトークンの取得に失敗しました。", { status: 500 });
         }
 
-        // ユーザー情報取得（失敗時は処理中止）
+        // ユーザー情報取得
         const user = await getDiscordUser(tokenData.access_token);
         if (!user || !user.id) {
           return new Response("Discordユーザー情報の取得に失敗しました。", { status: 500 });
         }
 
-        return renderAuthPage(user.id, tokenData.access_token, guildId, env.HCAPTCHA_SITEKEY);
+        // セッション識別子を発行してアクセストークンを一時保持 (隠しパラメータでの露呈を防ぐ)
+        const sessionKey = crypto.randomUUID();
+        const sessionPayload = JSON.stringify({
+          userId: user.id,
+          accessToken: tokenData.access_token,
+          guildId: guildId || "global"
+        });
+
+        // Workerの簡易キャッシュ等または暗号化トークンCookieとして渡す
+        const response = renderAuthPage(user.id, sessionKey, env.HCAPTCHA_SITEKEY);
+        response.headers.append(
+          "Set-Cookie",
+          `v_sess=${encodeURIComponent(sessionPayload)}; Path=/verify; HttpOnly; Secure; SameSite=Strict; Max-Age=600`
+        );
+        // 使った oauth_state は削除
+        response.headers.append("Set-Cookie", "oauth_state=; Path=/; HttpOnly; Secure; Max-Age=0");
+
+        return response;
       }
 
       // 4. データ計測 & Discord へメタデータ送信
       if (url.pathname === "/verify" && request.method === "POST") {
+        const sessCookie = cookies["v_sess"];
+        if (!sessCookie) {
+          return new Response("セッションの期限が切れているか無効です。最初からやり直してください。", { status: 401 });
+        }
+
+        let session;
+        try {
+          session = JSON.parse(decodeURIComponent(sessCookie));
+        } catch (e) {
+          return new Response("無効なセッションデータです。", { status: 400 });
+        }
+
         const formData = await request.formData();
         const hCaptchaResponse = formData.get("h-captcha-response");
-        const discordId = formData.get("discord_id");
-        const accessToken = formData.get("access_token");
-        const guildId = formData.get("guild_id") || "global";
+        const termsAgreed = formData.get("terms_agreed");
         const clientIp = request.headers.get("cf-connecting-ip") || "";
 
-        if (!discordId || !accessToken) {
-          return new Response("不正なリクエストパラメータです。", { status: 400 });
+        // 利用規約同意チェックの検証
+        if (!termsAgreed) {
+          return new Response("利用規約およびプライバシーポリシーへの同意が必要です。", { status: 400 });
         }
+
+        const discordId = session.userId;
+        const accessToken = session.accessToken;
+        const guildId = session.guildId;
 
         // A. hCaptcha 検証
         let humanVerified = 0;
@@ -76,37 +137,43 @@ export default {
           vpnClean = 0;
         }
 
-        // C. サブアカウント数のカウント
+        // C. サブアカウント数のカウント（Cookie + DBによるデバイス識別）
+        let deviceId = cookies["device_id"];
+        if (!deviceId) {
+          deviceId = crypto.randomUUID();
+        }
+
         let subAccountNumber = 1;
         try {
+          // 同一デバイスIDまたは同一IPかつ別Discord IDの既存認証数をカウント
           const existingRecords = await env.DB.prepare(
-            "SELECT discord_id FROM users WHERE guild_id = ? AND verified_at IS NOT NULL"
+            "SELECT discord_id, device_id FROM users WHERE guild_id = ? AND verified_at IS NOT NULL"
           ).bind(guildId).all();
 
-          if (!existingRecords || !existingRecords.results) {
-            throw new Error("D1 query returned invalid result.");
+          if (existingRecords && existingRecords.results) {
+            const otherAccounts = existingRecords.results.filter(
+              (r) => r.discord_id !== discordId && (r.device_id === deviceId)
+            );
+            subAccountNumber = otherAccounts.length + 1;
           }
-
-          const otherAccounts = existingRecords.results.filter((r) => r.discord_id !== discordId);
-          subAccountNumber = otherAccounts.length + 1;
         } catch (e) {
-          return new Response("データベースエラーが発生したため認証処理を中止しました。", { status: 500 });
+          return new Response("データベースエラーが発生しました。", { status: 500 });
         }
 
         // D. DBの保存・更新
         const expiresAt = Math.floor(Date.now() / 1000) + 3600;
         try {
           await env.DB.prepare(
-            `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, last_ip)
-             VALUES (?, ?, ?, 'N/A', ?, ?, ?)
+            `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, last_ip, device_id)
+             VALUES (?, ?, ?, 'N/A', ?, ?, ?, ?)
              ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
-               access_token=?, expires_at=?, verified_at=?, last_ip=?`
+               access_token=?, expires_at=?, verified_at=?, last_ip=?, device_id=?`
           ).bind(
-            discordId, guildId, accessToken, expiresAt, Math.floor(Date.now() / 1000), clientIp,
-            accessToken, expiresAt, Math.floor(Date.now() / 1000), clientIp
+            discordId, guildId, accessToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId,
+            accessToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId
           ).run();
         } catch (e) {
-          return new Response("データベースへの保存に失敗したため処理を中止しました。", { status: 500 });
+          return new Response("データベースへの保存に失敗しました。", { status: 500 });
         }
 
         // E. Discord へメタデータ送信
@@ -120,9 +187,18 @@ export default {
           return new Response("Discord Linked Role メタデータの更新に失敗しました。", { status: 500 });
         }
 
-        return new Response("認証処理が完了しました！Discord画面に戻り、ロールの取得状況を確認してください。", {
+        const res = new Response("認証処理が完了しました！Discord画面に戻り、ロールの取得状況を確認してください。", {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
+
+        // 端末識別用Cookieのセット（有効期限1年）およびセッションCookieの消去
+        res.headers.append(
+          "Set-Cookie",
+          `device_id=${deviceId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`
+        );
+        res.headers.append("Set-Cookie", "v_sess=; Path=/verify; HttpOnly; Secure; Max-Age=0");
+
+        return res;
       }
 
       return Response.redirect(`${url.origin}/privacy`, 302);
@@ -181,7 +257,7 @@ async function handleUpdateMetadata(env) {
 
 /* --- UI描画 --- */
 
-function renderAuthPage(userId, accessToken, guildId, siteKey) {
+function renderAuthPage(userId, sessionKey, siteKey) {
   const html = `
     <!DOCTYPE html>
     <html lang="ja">
@@ -191,10 +267,14 @@ function renderAuthPage(userId, accessToken, guildId, siteKey) {
       <title>Discord アカウント検証</title>
       <script src="https://js.hcaptcha.com/1/api.js" async defer></script>
       <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; background: #313338; color: white; margin: 0; }
-        .card { background: #2b2d31; padding: 30px; border-radius: 8px; text-align: center; box-shadow: 0 4px 10px rgba(0,0,0,0.3); max-width: 400px; width: 90%; }
-        button { margin-top: 15px; padding: 12px 20px; background: #5865F2; border: none; color: white; border-radius: 4px; font-weight: bold; cursor: pointer; width: 100%; font-size: 15px; }
-        button:hover { background: #4752C4; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #313338; color: white; margin: 0; padding: 20px 0; box-sizing: border-box; }
+        .card { background: #2b2d31; padding: 30px; border-radius: 8px; text-align: center; box-shadow: 0 4px 10px rgba(0,0,0,0.3); max-width: 420px; width: 90%; }
+        .terms-box { text-align: left; background: #1e1f22; padding: 12px; border-radius: 4px; font-size: 13px; margin: 15px 0; color: #dbdee1; }
+        .checkbox-container { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 15px 0; font-size: 13px; cursor: pointer; }
+        .checkbox-container input { cursor: pointer; width: 16px; height: 16px; }
+        button { margin-top: 10px; padding: 12px 20px; background: #5865F2; border: none; color: white; border-radius: 4px; font-weight: bold; cursor: pointer; width: 100%; font-size: 15px; }
+        button:disabled { background: #4e5058; cursor: not-allowed; }
+        button:hover:not(:disabled) { background: #4752C4; }
         .footer { margin-top: 15px; font-size: 12px; color: #949ba4; }
         .footer a { color: #00a8fc; text-decoration: none; }
       </style>
@@ -202,18 +282,20 @@ function renderAuthPage(userId, accessToken, guildId, siteKey) {
     <body>
       <div class="card">
         <h2>Discord 連携認証</h2>
-        <p style="font-size: 14px; color: #dbdee1;">下の Captcha を完了して「送信」を押してください。</p>
+        <p style="font-size: 14px; color: #dbdee1;">利用規約を確認し、Captcha を完了して送信してください。</p>
         
-        <form action="/verify" method="POST">
-          <input type="hidden" name="discord_id" value="${userId}" />
-          <input type="hidden" name="access_token" value="${accessToken}" />
-          <input type="hidden" name="guild_id" value="${guildId}" />
-
+        <form action="/verify" method="POST" id="verifyForm">
           <div class="h-captcha" data-sitekey="${siteKey}"></div>
-          <button type="submit">送信して完了</button>
+
+          <label class="checkbox-container">
+            <input type="checkbox" id="termsCheck" name="terms_agreed" value="true" required onchange="document.getElementById('submitBtn').disabled = !this.checked;">
+            <span><a href="/terms" target="_blank" style="color: #00a8fc;">利用規約</a> と <a href="/privacy" target="_blank" style="color: #00a8fc;">プライバシーポリシー</a> に同意する</span>
+          </label>
+
+          <button type="submit" id="submitBtn" disabled>同意して送信</button>
         </form>
         <div class="footer">
-          <a href="/privacy" target="_blank">プライバシーポリシー</a>
+          <a href="/terms" target="_blank">利用規約</a> | <a href="/privacy" target="_blank">プライバシーポリシー</a>
         </div>
       </div>
     </body>
@@ -228,21 +310,96 @@ function renderPrivacyPolicy() {
     <html lang="ja">
     <head>
       <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
       <title>プライバシーポリシー</title>
       <style>
         body { font-family: sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; background: #1e1f22; color: #dbdee1; }
         .container { background: #2b2d31; padding: 30px; border-radius: 8px; }
+        h1 { border-bottom: 1px solid #4e5058; padding-bottom: 10px; }
       </style>
     </head>
     <body>
       <div class="container">
         <h1>プライバシーポリシー</h1>
-        <p>本認証システムは、Bot防止・接続元セキュリティ検証および連携ロール付与の目的でのみアカウント情報およびIP情報を処理します。</p>
+        <p>本認証システム（以下「当サービス」）は、ユーザーの個人情報の取扱いについて以下のとおりポリシーを定め、適切に管理します。</p>
+        
+        <h3>1. 取得する情報</h3>
+        <ul>
+          <li>Discord アカウント情報（ID、アクセス許可情報）</li>
+          <li>接続元情報（IPアドレス、接続種別判定結果）</li>
+          <li>識別用 Cookie（サブアカウント検出およびセッション維持用途）</li>
+        </ul>
+
+        <h3>2. 利用目的</h3>
+        <ul>
+          <li>Bot・自動化プログラムによるスパム防止</li>
+          <li>VPN/プロキシ等を経由した不正アクセスの判定</li>
+          <li>Linked Role（連携ロール）メタデータのDiscordへの送信</li>
+          <li>同一端末からの複数サブアカウント制限の判定</li>
+        </ul>
+
+        <h3>3. 情報の管理・第三者提供</h3>
+        <p>取得した情報は認証・ロール付与に必要な目的以外には使用せず、法令に基づく場合を除き第三者へ開示・提供することはありません。</p>
       </div>
     </body>
     </html>
   `;
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+function renderTermsOfService() {
+  const html = `
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>利用規約</title>
+      <style>
+        body { font-family: sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; background: #1e1f22; color: #dbdee1; }
+        .container { background: #2b2d31; padding: 30px; border-radius: 8px; }
+        h1 { border-bottom: 1px solid #4e5058; padding-bottom: 10px; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>利用規約</h1>
+        <p>本規約は、当認証システム（以下「当サービス」）の利用条件を定めるものです。利用者は本規約に同意の上、当サービスを利用するものとします。</p>
+
+        <h3>1. 遵守事項</h3>
+        <ul>
+          <li>利用者は、スパム行為、不正アクセス、セキュリティ検証の迂回を目的とした利用を行ってはなりません。</li>
+          <li>複数のサブアカウントを用いて不当に制限を迂回する行為を禁止します。</li>
+        </ul>
+
+        <h3>2. サービスの停止・変更</h3>
+        <p>当サービスは、保守点検や攻撃への対処などのため、予告なくサービスの提供を一時停止または終了することがあります。</p>
+
+        <h3>3. 免責事項</h3>
+        <p>当サービスの利用により発生したいかなる損害についても、運営者は一切の責任を負いません。</p>
+      </div>
+    </body>
+    </html>
+  `;
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+/* --- Cookie 解析ヘルパー --- */
+
+function parseCookies(cookieHeader) {
+  const list = {};
+  if (!cookieHeader) return list;
+
+  cookieHeader.split(";").forEach((cookie) => {
+    const parts = cookie.split("=");
+    const name = parts.shift()?.trim();
+    const value = parts.join("=")?.trim();
+    if (name) {
+      list[name] = decodeURIComponent(value);
+    }
+  });
+
+  return list;
 }
 
 /* --- 外部API通信 & セキュリティ判定 --- */
@@ -351,7 +508,6 @@ async function checkTsukubaVpn(clientIp) {
   if (!clientIp) return true;
 
   try {
-    // Cloudflareのキャッシュ指定オプションを互換性のある形式に修正
     const requestOptions = {
       headers: { "User-Agent": "Cloudflare-Worker" }
     };
