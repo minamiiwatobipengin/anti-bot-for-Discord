@@ -13,5 +13,5 @@ DISCORD_REDIRECT_URI = "https://anti-bot-for-discord.iwatobi.workers.dev/callbac
 HCAPTCHA_SITEKEY = "58be8b94-00e8-4844-bf1c-36a8542e548c"
 
 [observability.logs]
-enabled = false
+enabled = true
 invocation_logs = true
