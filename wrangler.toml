@@ -1,0 +1,13 @@
+name = "discord-antivpn-worker"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "discord-auth-db"
+database_id = "YOUR_D1_DATABASE_ID" # d1 create実行後に差し替え
+
+[vars]
+DISCORD_CLIENT_ID = "1545763203844149328"
+DISCORD_REDIRECT_URI = "https://anti-bot-for-discord.iwatobi.workers.dev/callback"
+HCAPTCHA_SITEKEY = "58be8b94-00e8-4844-bf1c-36a8542e548c"
