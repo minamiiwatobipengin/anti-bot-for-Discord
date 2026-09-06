@@ -1,6 +1,11 @@
 const ADMIN_DISCORD_ID = "1506950854249418765";
 const SESSION_TTL_SECONDS = 600;
+const OAUTH_STATE_TTL_SECONDS = 600;
+const MAX_OAUTH_STATES = 5;
 const MAX_GUILD_ID_LENGTH = 20;
+const MAX_FORM_BODY_BYTES = 64 * 1024;
+const MAX_ADMIN_UNLINK_USERS = 100;
+const EXTERNAL_REQUEST_TIMEOUT_MS = 10000;
 
 export default {
   async fetch(request, env) {
@@ -39,20 +44,24 @@ export default {
         const requestedGuildId = url.searchParams.get("guild_id") || "global";
         const guildId = isValidGuildId(requestedGuildId) ? requestedGuildId : "global";
         const stateToken = crypto.randomUUID();
-        const statePayload = `${guildId}:${stateToken}`;
+
+        try {
+          await saveOAuthState(env, stateToken, guildId);
+        } catch (e) {
+          console.error("OAuth state save failed");
+          return new Response("認証セッションの保存に失敗しました。", { status: 500 });
+        }
 
         const authUrl = `https://discord.com/oauth2/authorize?client_id=${
           env.DISCORD_CLIENT_ID
         }&redirect_uri=${encodeURIComponent(
           env.DISCORD_REDIRECT_URI
-        )}&response_type=code&scope=identify%20role_connections.write&state=${encodeURIComponent(statePayload)}`;
+        )}&response_type=code&scope=identify%20role_connections.write&state=${encodeURIComponent(stateToken)}`;
 
         const headers = new Headers();
         headers.set("Location", authUrl);
-        headers.append(
-          "Set-Cookie",
-          `oauth_state=${stateToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
-        );
+        const oauthStates = addOAuthState(cookies["oauth_state"], stateToken);
+        headers.append("Set-Cookie", makeOAuthStateCookie(oauthStates));
 
         return new Response(null, { status: 302, headers });
       }
@@ -69,14 +78,15 @@ export default {
           return new Response("認証パラメータが不足しています。", { status: 400 });
         }
 
-        const stateParts = state.split(":");
-        const stateToken = stateParts.pop();
-        const guildId = stateParts.join(":") || "global";
-        const savedState = cookies["oauth_state"];
-
-        if (!savedState || !stateToken || savedState !== stateToken || !isValidGuildId(guildId)) {
+        if (!/^[0-9a-f-]{36}$/.test(state)) {
           return new Response("無効なセッションまたはCSRFトークンの検証に失敗しました。", { status: 403 });
         }
+
+        const stateResult = await consumeOAuthState(env, state, cookies["oauth_state"]);
+        if (!stateResult) {
+          return new Response("無効なセッションまたはCSRFトークンの検証に失敗しました。", { status: 403 });
+        }
+        const { guildId, remainingStates } = stateResult;
 
         const tokenData = await exchangeCode(code, env);
         if (!tokenData || !tokenData.access_token) {
@@ -115,7 +125,7 @@ export default {
           "Set-Cookie",
           `v_sess=${sessionId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`
         );
-        response.headers.append("Set-Cookie", "oauth_state=; Path=/; HttpOnly; Secure; Max-Age=0");
+        response.headers.append("Set-Cookie", makeOAuthStateCookie(remainingStates));
 
         return response;
       }
@@ -136,7 +146,10 @@ export default {
           return new Response("セッションが見つからないか期限切れです。", { status: 401 });
         }
 
-        const formData = await request.formData();
+        const formData = await readFormDataWithLimit(request, MAX_FORM_BODY_BYTES);
+        if (!formData) {
+          return new Response("リクエストが大きすぎます。", { status: 413 });
+        }
         const hCaptchaResponse = formData.get("h-captcha-response");
         const termsAgreed = formData.get("terms_agreed");
         const csrfToken = formData.get("csrf_token");
@@ -186,7 +199,7 @@ export default {
         }
 
         // C. デバイス識別子の設定・取得
-        let deviceId = cookies["device_id"];
+        let deviceId = await verifyDeviceCookie(cookies["device_id"], env.SESSION_SIGNING_KEY);
         if (!deviceId) {
           deviceId = crypto.randomUUID();
         }
@@ -195,66 +208,70 @@ export default {
         let subAccountNumber = 1;
         const nowSeconds = Math.floor(Date.now() / 1000);
         let createdAt = nowSeconds;
+        const lockToken = crypto.randomUUID();
 
-        try {
-          const existingUserRecord = await env.DB.prepare(
-            `SELECT sub_account_number, created_at FROM users WHERE discord_id = ?`
-          ).bind(discordId).first();
-
-          if (existingUserRecord) {
-            subAccountNumber = Number(existingUserRecord.sub_account_number) || 1;
-            createdAt = existingUserRecord.created_at;
-          } else {
-            const knownDiscordIds = new Set();
-
-            if (deviceId) {
-              const deviceMatches = await env.DB.prepare(
-                `SELECT DISTINCT discord_id FROM users WHERE device_id = ? AND discord_id != ?`
-              ).bind(deviceId, discordId).all();
-
-              if (deviceMatches?.results) {
-                for (const row of deviceMatches.results) {
-                  if (row.discord_id) knownDiscordIds.add(row.discord_id);
-                }
-              }
-            }
-
-            if (vpnClean === 1 && clientIp) {
-              const ipMatches = await env.DB.prepare(
-                `SELECT DISTINCT discord_id FROM users WHERE last_ip = ? AND discord_id != ?`
-              ).bind(clientIp, discordId).all();
-
-              if (ipMatches?.results) {
-                for (const row of ipMatches.results) {
-                  if (row.discord_id) knownDiscordIds.add(row.discord_id);
-                }
-              }
-            }
-
-            subAccountNumber = knownDiscordIds.size + 1;
-          }
-        } catch (e) {
-          console.error("Sub account calculation error:", e);
-          return new Response("データベース判定処理でエラーが発生しました。", { status: 500 });
+        if (!await acquireVerificationLock(env, lockToken, nowSeconds)) {
+          return new Response("認証処理が集中しています。しばらく待ってから再試行してください。", { status: 503 });
         }
 
-        // E. DBへの保存・更新
-        const expiresAt = nowSeconds + 3600;
-
         try {
-          await env.DB.prepare(
-            `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, created_at, last_ip, device_id, sub_account_number)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
-               access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?, sub_account_number = ?`
-          ).bind(
-            discordId, guildId, storedAccessToken, storedRefreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId, subAccountNumber,
-            storedAccessToken, storedRefreshToken, expiresAt, nowSeconds, clientIp, deviceId, subAccountNumber
-          ).run();
+          try {
+            const existingUserRecord = await env.DB.prepare(
+              `SELECT sub_account_number, created_at FROM users WHERE discord_id = ?`
+            ).bind(discordId).first();
 
+            if (existingUserRecord) {
+              subAccountNumber = Number(existingUserRecord.sub_account_number) || 1;
+              createdAt = existingUserRecord.created_at;
+            } else {
+              const knownDiscordIds = new Set();
+
+              if (deviceId) {
+                const deviceMatches = await env.DB.prepare(
+                  `SELECT DISTINCT discord_id FROM users WHERE device_id = ? AND discord_id != ?`
+                ).bind(deviceId, discordId).all();
+
+                if (deviceMatches?.results) {
+                  for (const row of deviceMatches.results) {
+                    if (row.discord_id) knownDiscordIds.add(row.discord_id);
+                  }
+                }
+              }
+
+              if (vpnClean === 1 && clientIp) {
+                const ipMatches = await env.DB.prepare(
+                  `SELECT DISTINCT discord_id FROM users WHERE last_ip = ? AND discord_id != ?`
+                ).bind(clientIp, discordId).all();
+
+                if (ipMatches?.results) {
+                  for (const row of ipMatches.results) {
+                    if (row.discord_id) knownDiscordIds.add(row.discord_id);
+                  }
+                }
+              }
+
+              subAccountNumber = knownDiscordIds.size + 1;
+            }
+
+            // 判定と保存を同じロック内で行い、同時検証による番号重複を防ぐ。
+            const expiresAt = nowSeconds + 3600;
+            await env.DB.prepare(
+              `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, created_at, last_ip, device_id, sub_account_number)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(discord_id, guild_id) DO UPDATE SET
+                 access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?, sub_account_number = ?`
+            ).bind(
+              discordId, guildId, storedAccessToken, storedRefreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId, subAccountNumber,
+              storedAccessToken, storedRefreshToken, expiresAt, nowSeconds, clientIp, deviceId, subAccountNumber
+            ).run();
+          } catch (e) {
+            console.error("Database verification error");
+            return new Response("データベース処理でエラーが発生しました。", { status: 500 });
+          }
         } catch (e) {
-          console.error("D1 Insert Error");
-          return new Response("データベースへの保存に失敗しました。", { status: 500 });
+          return new Response("認証処理でエラーが発生しました。", { status: 500 });
+        } finally {
+          await releaseVerificationLock(env, lockToken);
         }
 
         // F. Discord へメタデータ送信
@@ -278,7 +295,7 @@ export default {
 
         res.headers.append(
           "Set-Cookie",
-          `device_id=${deviceId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`
+          `device_id=${await signDeviceCookie(deviceId, env.SESSION_SIGNING_KEY)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`
         );
         res.headers.append("Set-Cookie", "v_sess=; Path=/; HttpOnly; Secure; Max-Age=0");
 
@@ -304,7 +321,13 @@ export default {
           return new Response("アクセス権限がありません。管理者IDのみ実行可能です。", { status: 403 });
         }
 
-        const { results } = await env.DB.prepare("SELECT discord_id, access_token FROM users").all();
+        await purgeExpiredUsers(env);
+        const { results } = await env.DB.prepare(
+          "SELECT discord_id, access_token FROM users WHERE expires_at > ? LIMIT ?"
+        ).bind(Math.floor(Date.now() / 1000), MAX_ADMIN_UNLINK_USERS + 1).all();
+        if (results && results.length > MAX_ADMIN_UNLINK_USERS) {
+          return new Response(`対象ユーザーが多すぎます。一括処理は${MAX_ADMIN_UNLINK_USERS}件までです。`, { status: 413 });
+        }
         let successCount = 0;
         let failCount = 0;
 
@@ -332,6 +355,9 @@ export default {
       console.error("Unhandled request error");
       return new Response("システムエラーが発生しました。", { status: 500 });
     }
+  },
+  async scheduled(controller, env) {
+    await purgeExpiredUsers(env);
   }
 };
 
@@ -359,6 +385,110 @@ async function getSession(env, sessionId) {
   }
 }
 
+async function purgeExpiredUsers(env) {
+  await env.DB.prepare(
+    "DELETE FROM users WHERE expires_at <= ?"
+  ).bind(Math.floor(Date.now() / 1000)).run();
+}
+
+async function readFormDataWithLimit(request, maxBytes) {
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength && Number(contentLength) > maxBytes) return null;
+  if (!request.body) return request.formData();
+
+  const reader = request.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    return null;
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return new Request(request, { body }).formData();
+}
+
+async function saveOAuthState(env, stateToken, guildId) {
+  const cutoff = Math.floor(Date.now() / 1000) - OAUTH_STATE_TTL_SECONDS;
+  await env.DB.prepare(
+    "DELETE FROM sessions WHERE session_id LIKE 'oauth:%' AND created_at < ?"
+  ).bind(cutoff).run();
+  await env.DB.prepare(
+    "INSERT INTO sessions (session_id, payload, created_at) VALUES (?, ?, ?)"
+  ).bind(
+    `oauth:${stateToken}`,
+    JSON.stringify({ type: "oauth", guildId }),
+    Math.floor(Date.now() / 1000)
+  ).run();
+}
+
+function parseOAuthStates(value) {
+  if (!value) return [];
+
+  try {
+    const states = JSON.parse(value);
+    if (!Array.isArray(states)) return [];
+    return states.filter(state => typeof state === "string" && /^[0-9a-f-]{36}$/.test(state));
+  } catch (e) {
+    return [];
+  }
+}
+
+function addOAuthState(value, stateToken) {
+  const states = parseOAuthStates(value).filter(state => state !== stateToken);
+  states.push(stateToken);
+  return states.slice(-MAX_OAUTH_STATES);
+}
+
+function makeOAuthStateCookie(states) {
+  if (!states.length) {
+    return "oauth_state=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0";
+  }
+
+  return `oauth_state=${encodeURIComponent(JSON.stringify(states))}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${OAUTH_STATE_TTL_SECONDS}`;
+}
+
+async function consumeOAuthState(env, stateToken, cookieValue) {
+  const states = parseOAuthStates(cookieValue);
+  if (!states.includes(stateToken)) return null;
+
+  try {
+    const remainingStates = states.filter(state => state !== stateToken);
+    const result = await env.DB.prepare(
+      "DELETE FROM sessions WHERE session_id = ? AND created_at >= ? RETURNING payload, created_at"
+    ).bind(
+      `oauth:${stateToken}`,
+      Math.floor(Date.now() / 1000) - OAUTH_STATE_TTL_SECONDS
+    ).first();
+    if (!result?.payload) return null;
+
+    const payload = JSON.parse(result.payload);
+    if (payload?.type !== "oauth" || !isValidGuildId(payload.guildId)) return null;
+
+    return { guildId: payload.guildId, remainingStates };
+  } catch (e) {
+    console.error("OAuth state lookup failed");
+    return null;
+  }
+}
+
 function getClientIp(request) {
   return request.headers.get("cf-connecting-ip") || "unknown";
 }
@@ -375,6 +505,34 @@ async function enforceRateLimit(binding, key) {
   } catch (e) {
     console.error("Rate limit check failed");
     return false;
+  }
+}
+
+async function acquireVerificationLock(env, lockToken, nowSeconds) {
+  try {
+    await env.DB.prepare(
+      "CREATE TABLE IF NOT EXISTS verification_locks (id INTEGER PRIMARY KEY, lock_token TEXT NOT NULL, locked_until INTEGER NOT NULL)"
+    ).run();
+    await env.DB.prepare(
+      "INSERT OR IGNORE INTO verification_locks (id, lock_token, locked_until) VALUES (1, '', 0)"
+    ).run();
+    const result = await env.DB.prepare(
+      "UPDATE verification_locks SET lock_token = ?, locked_until = ? WHERE id = 1 AND locked_until < ?"
+    ).bind(lockToken, nowSeconds + 15, nowSeconds).run();
+    return result?.meta?.changes === 1;
+  } catch (e) {
+    console.error("Verification lock failed");
+    return false;
+  }
+}
+
+async function releaseVerificationLock(env, lockToken) {
+  try {
+    await env.DB.prepare(
+      "UPDATE verification_locks SET lock_token = '', locked_until = 0 WHERE id = 1 AND lock_token = ?"
+    ).bind(lockToken).run();
+  } catch (e) {
+    console.error("Verification lock release failed");
   }
 }
 
@@ -410,6 +568,55 @@ async function importEncryptionKey(encodedKey) {
   );
 }
 
+async function importSigningKey(encodedKey) {
+  if (!encodedKey || typeof encodedKey !== "string") {
+    throw new Error("SESSION_SIGNING_KEY is not configured");
+  }
+
+  const keyBytes = decodeBase64(encodedKey.trim());
+  if (keyBytes.byteLength !== 32) {
+    throw new Error("SESSION_SIGNING_KEY must decode to 32 bytes");
+  }
+
+  return crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+async function signDeviceCookie(deviceId, encodedKey) {
+  const key = await importSigningKey(encodedKey);
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(deviceId)
+  );
+  return `${deviceId}.${encodeBase64(new Uint8Array(signature))}`;
+}
+
+async function verifyDeviceCookie(value, encodedKey) {
+  if (typeof value !== "string") return null;
+
+  const parts = value.split(".");
+  if (parts.length !== 2 || !/^[0-9a-f-]{36}$/.test(parts[0])) return null;
+
+  try {
+    const key = await importSigningKey(encodedKey);
+    const valid = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      decodeBase64(parts[1]),
+      new TextEncoder().encode(parts[0])
+    );
+    return valid ? parts[0] : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function encryptSecret(value, encodedKey) {
   const key = await importEncryptionKey(encodedKey);
   const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -421,8 +628,7 @@ async function encryptSecret(value, encodedKey) {
 async function decryptSecret(value, encodedKey) {
   if (typeof value !== "string" || !encodedKey) return null;
 
-  // 旧データは次回の検証成功時に暗号化して置き換えるため、一時的に読めるようにする。
-  if (!value.startsWith("enc:v1:")) return value;
+  if (!value.startsWith("enc:v1:")) return null;
 
   try {
     const encoded = value.slice("enc:v1:".length).split(".");
@@ -455,6 +661,15 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
+function withSecurityHeaders(response, noStore = false) {
+  response.headers.set("X-Content-Type-Options", "nosniff");
+  response.headers.set("X-Frame-Options", "DENY");
+  response.headers.set("Referrer-Policy", "no-referrer");
+  response.headers.set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; script-src 'self' https://js.hcaptcha.com 'unsafe-inline'; frame-src https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com");
+  if (noStore) response.headers.set("Cache-Control", "no-store");
+  return response;
+}
+
 async function handleDeleteMyData(request, cookies, env) {
   if (request.method !== "GET" && request.method !== "POST") {
     return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET, POST" } });
@@ -482,7 +697,7 @@ async function handleDeleteMyData(request, cookies, env) {
   }
 
   if (request.method === "GET") {
-    return new Response(`
+    return withSecurityHeaders(new Response(`
       <!DOCTYPE html><html lang="ja"><meta charset="UTF-8"><title>データ削除確認</title>
       <body><h1>データ削除確認</h1>
       <p>保存された認証データとDiscord連携情報を削除します。この操作は取り消せません。</p>
@@ -490,15 +705,22 @@ async function handleDeleteMyData(request, cookies, env) {
         <input type="hidden" name="csrf_token" value="${escapeHtml(session.csrfToken)}">
         <button type="submit">データを削除する</button>
       </form></body></html>
-    `, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    `, { headers: { "Content-Type": "text/html; charset=utf-8" } }), true);
   }
 
-  const formData = await request.formData();
+  const formData = await readFormDataWithLimit(request, MAX_FORM_BODY_BYTES);
+  if (!formData) {
+    return new Response("リクエストが大きすぎます。", { status: 413 });
+  }
   if (formData.get("csrf_token") !== session.csrfToken) {
     return new Response("CSRFトークンの検証に失敗しました。", { status: 403 });
   }
 
-  await updateRoleConnection(session.accessToken, {}, env);
+  const roleConnectionCleared = await updateRoleConnection(session.accessToken, {}, env);
+  const accessTokenRevoked = await revokeDiscordToken(session.accessToken, env);
+  const refreshTokenRevoked = session.refreshToken !== "N/A"
+    ? await revokeDiscordToken(session.refreshToken, env)
+    : true;
 
   try {
     await env.DB.prepare("DELETE FROM users WHERE discord_id = ?").bind(session.userId).run();
@@ -511,7 +733,10 @@ async function handleDeleteMyData(request, cookies, env) {
     <html>
       <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #1e1f22; color: #dbdee1;">
         <h1>データ削除完了</h1>
-        <p>あなたの認証データおよびDiscord連携情報を正常に削除しました。</p>
+        <p>保存データを削除しました。</p>
+        <p>${roleConnectionCleared && accessTokenRevoked && refreshTokenRevoked
+          ? "Discord の連携情報と認証トークンも失効させました。"
+          : "Discord 側の連携解除または認証トークン失効に失敗しました。管理者へ連絡してください。"}</p>
       </body>
     </html>
   `, { headers: { "Content-Type": "text/html; charset=utf-8" } });
@@ -519,7 +744,7 @@ async function handleDeleteMyData(request, cookies, env) {
   res.headers.append("Set-Cookie", "v_sess=; Path=/; HttpOnly; Secure; Max-Age=0");
   res.headers.append("Set-Cookie", "device_id=; Path=/; HttpOnly; Secure; Max-Age=0");
 
-  return res;
+  return withSecurityHeaders(res, true);
 }
 
 /* --- メタデータ定義更新 --- */
@@ -554,7 +779,7 @@ async function handleUpdateMetadata(request, cookies, env) {
       }
     ];
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: "PUT",
       headers: {
         "Authorization": `Bot ${env.DISCORD_BOT_TOKEN}`,
@@ -641,7 +866,7 @@ function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
     </body>
     </html>
   `;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return withSecurityHeaders(new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } }), true);
 }
 
 function renderPrivacyPolicy(origin) {
@@ -694,7 +919,7 @@ function renderPrivacyPolicy(origin) {
     </body>
     </html>
   `;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return withSecurityHeaders(new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } }), true);
 }
 
 function renderTermsOfService() {
@@ -731,7 +956,7 @@ function renderTermsOfService() {
     </body>
     </html>
   `;
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return withSecurityHeaders(new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } }), true);
 }
 
 /* --- Cookie 解析ヘルパー --- */
@@ -758,6 +983,16 @@ function parseCookies(cookieHeader) {
 
 /* --- 外部API通信 & セキュリティ判定 --- */
 
+async function fetchWithTimeout(input, init = {}) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), EXTERNAL_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function exchangeCode(code, env) {
   try {
     const params = new URLSearchParams({
@@ -768,7 +1003,7 @@ async function exchangeCode(code, env) {
       redirect_uri: env.DISCORD_REDIRECT_URI
     });
 
-    const res = await fetch("https://discord.com/api/v10/oauth2/token", {
+    const res = await fetchWithTimeout("https://discord.com/api/v10/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: params.toString()
@@ -781,9 +1016,29 @@ async function exchangeCode(code, env) {
   }
 }
 
+async function revokeDiscordToken(token, env) {
+  if (!token || token === "N/A") return true;
+
+  try {
+    const params = new URLSearchParams({
+      client_id: env.DISCORD_CLIENT_ID,
+      client_secret: env.DISCORD_CLIENT_SECRET,
+      token
+    });
+    const res = await fetchWithTimeout("https://discord.com/api/v10/oauth2/token/revoke", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString()
+    });
+    return res.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function getDiscordUser(accessToken) {
   try {
-    const res = await fetch("https://discord.com/api/v10/users/@me", {
+    const res = await fetchWithTimeout("https://discord.com/api/v10/users/@me", {
       headers: { Authorization: `Bearer ${accessToken}` }
     });
 
@@ -798,7 +1053,7 @@ async function verifyHCaptcha(token, secret) {
   if (!token) return false;
   try {
     const params = new URLSearchParams({ secret, response: token });
-    const res = await fetch("https://hcaptcha.com/siteverify", {
+    const res = await fetchWithTimeout("https://hcaptcha.com/siteverify", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: params.toString()
@@ -858,7 +1113,7 @@ async function checkTsukubaVpn(clientIp) {
 
   if (!response) {
     try {
-      response = await fetch("https://www.vpngate.net/api/iphone/", {
+      response = await fetchWithTimeout("https://www.vpngate.net/api/iphone/", {
         headers: { "User-Agent": "Cloudflare-Worker" }
       });
 
@@ -877,11 +1132,42 @@ async function checkTsukubaVpn(clientIp) {
   }
 
   try {
-    const text = await response.text();
+    const text = await readResponseTextWithLimit(response, 5 * 1024 * 1024);
+    if (text === null) return false;
     return text.includes(`,${clientIp},`);
   } catch (e) {
     return false;
   }
+}
+
+async function readResponseTextWithLimit(response, maxBytes) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    return null;
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
 }
 
 async function updateRoleConnection(accessToken, metadata, env) {
@@ -892,7 +1178,7 @@ async function updateRoleConnection(accessToken, metadata, env) {
       metadata
     };
 
-    const res = await fetch(url, {
+    const res = await fetchWithTimeout(url, {
       method: "PUT",
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -905,8 +1191,7 @@ async function updateRoleConnection(accessToken, metadata, env) {
       return true;
     }
 
-    const errText = await res.text();
-    console.error(`[Linked Role Error] Status: ${res.status}, Body: ${errText}`);
+    console.error(`[Linked Role Error] Status: ${res.status}`);
     return false;
   } catch (e) {
     console.error("[Linked Role Exception]", e);
