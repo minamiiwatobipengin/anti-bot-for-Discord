@@ -148,75 +148,60 @@ export default {
           deviceId = crypto.randomUUID();
         }
 
-        // D. メイン/サブアカウント判定ロジック
+        // D. 厳密なメイン/サブアカウント順位判定ロジック
         let subAccountNumber = 1;
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        let createdAt = nowSeconds;
+
         try {
-          let existingAccounts;
+          // 既にこの Discord ID のレコードが存在するか確認
+          const existingUserRecord = await env.DB.prepare(
+            `SELECT sub_account_number, created_at FROM users WHERE discord_id = ?`
+          ).bind(discordId).first();
 
-          // プロキシ/VPN使用時 (vpnClean === 0) は IP 一致判定を除外し Cookie (device_id) のみで判定
-          if (vpnClean === 0) {
-            existingAccounts = await env.DB.prepare(
-              `SELECT discord_id, MIN(created_at) as first_seen 
-               FROM users 
-               WHERE device_id = ? 
-               GROUP BY discord_id 
-               ORDER BY first_seen ASC`
-            ).bind(deviceId).all();
+          if (existingUserRecord) {
+            // 既存ユーザーの場合は、過去に確定した順位と初回作成日時を維持
+            subAccountNumber = existingUserRecord.sub_account_number;
+            createdAt = existingUserRecord.created_at;
           } else {
-            // プロキシ未検出時 (vpnClean === 1) は Cookie(device_id) または IP(last_ip) のいずれか一致で判定
-            existingAccounts = await env.DB.prepare(
-              `SELECT discord_id, MIN(created_at) as first_seen 
-               FROM users 
-               WHERE device_id = ? OR last_ip = ? 
-               GROUP BY discord_id 
-               ORDER BY first_seen ASC`
-            ).bind(deviceId, clientIp).all();
-          }
+            // 新規ユーザーの場合：過去の別アカウントの存在を検索
+            let relatedAccounts;
 
-          if (existingAccounts && existingAccounts.results && existingAccounts.results.length > 0) {
-            const list = existingAccounts.results;
-            const index = list.findIndex(acc => acc.discord_id === discordId);
-
-            if (index !== -1) {
-              // 過去に記録があるアカウント：最古の初回記録日時順のインデックス + 1
-              subAccountNumber = index + 1;
+            if (vpnClean === 0) {
+              // プロキシ/VPN使用時 (vpnClean === 0): IP一致を除外し Cookie (device_id) のみで判定
+              relatedAccounts = await env.DB.prepare(
+                `SELECT COUNT(DISTINCT discord_id) as count FROM users WHERE device_id = ?`
+              ).bind(deviceId).first();
             } else {
-              // 同一Cookie（または同一クリーンIP）の別アカウントがすでに存在する場合：次の順位を付与
-              subAccountNumber = list.length + 1;
+              // 通常時 (vpnClean === 1): Cookie (device_id) または IP (last_ip) のいずれか一致で判定
+              relatedAccounts = await env.DB.prepare(
+                `SELECT COUNT(DISTINCT discord_id) as count FROM users WHERE device_id = ? OR last_ip = ?`
+              ).bind(deviceId, clientIp).first();
             }
-          } else {
-            // 完全に新規の場合は 1 (メイン)
-            subAccountNumber = 1;
+
+            const existingCount = (relatedAccounts && relatedAccounts.count) ? Number(relatedAccounts.count) : 0;
+            // 既存のアカウント数 + 1 を本アカウントの順位とする
+            subAccountNumber = existingCount + 1;
           }
         } catch (e) {
           console.error("Sub account calculation error:", e);
-          return new Response("データベースエラーが発生しました。", { status: 500 });
+          return new Response("データベース判定処理でエラーが発生しました。", { status: 500 });
         }
 
-        // E. DBの保存・更新
-        const nowSeconds = Math.floor(Date.now() / 1000);
+        // E. DBへの保存・更新
         const expiresAt = nowSeconds + 3600;
 
         try {
-          // 現在のユーザーの最古の created_at を取得（初回認証時刻を維持するため）
-          const existingUserRecord = await env.DB.prepare(
-            `SELECT MIN(created_at) as min_created FROM users WHERE discord_id = ?`
-          ).bind(discordId).first();
-
-          const createdAt = existingUserRecord && existingUserRecord.min_created 
-            ? existingUserRecord.min_created 
-            : nowSeconds;
-
           await env.DB.prepare(
-            `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, created_at, last_ip, device_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, created_at, last_ip, device_id, sub_account_number)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
-               access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?`
+               access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?, sub_account_number = ?`
           ).bind(
-            // INSERT用 (9パラメータ)
-            discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId,
-            // UPDATE用 (6パラメータ)
-            accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId
+            // INSERT用 (10パラメータ)
+            discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId, subAccountNumber,
+            // UPDATE用 (7パラメータ)
+            accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId, subAccountNumber
           ).run();
         } catch (e) {
           console.error("D1 Insert Error:", e.message || e);
@@ -714,7 +699,6 @@ async function updateRoleConnection(accessToken, metadata, env) {
       body: JSON.stringify(body)
     });
 
-    // Discord API は成功時に 200 (OK) または 204 (No Content) を返します
     if (res.status === 200 || res.status === 204) {
       return true;
     }
