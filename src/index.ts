@@ -340,6 +340,7 @@ function renderPrivacyPolicy() {
 
         <h3>3. 情報の管理・第三者提供</h3>
         <p>取得した情報は認証・ロール付与に必要な目的以外には使用せず、法令に基づく場合を除き第三者へ開示・提供することはありません。</p>
+        <p>削除要請について:https://discord.gg/XdGrtFSbQ6からお申し出ください</p>
       </div>
     </body>
     </html>
