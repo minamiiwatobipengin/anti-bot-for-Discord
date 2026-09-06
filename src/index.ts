@@ -45,10 +45,7 @@ export default {
           `oauth_state=${stateToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
         );
 
-        return new Response(null, {
-          status: 302,
-          headers: headers
-        });
+        return new Response(null, { status: 302, headers });
       }
 
       // 3. OAuth2 コールバック受取 & 認証画面表示
@@ -77,17 +74,31 @@ export default {
           return new Response("Discordユーザー情報の取得に失敗しました。", { status: 500 });
         }
 
-        const sessionPayload = JSON.stringify({
+        // サーバーサイドセッション ID 発行
+        const sessionId = crypto.randomUUID();
+        const sessionPayload = {
           userId: user.id,
           accessToken: tokenData.access_token,
           refreshToken: tokenData.refresh_token || "N/A",
           guildId: guildId || "global"
-        });
+        };
+
+        // D1 sessions テーブルに安全に保存
+        try {
+          await env.DB.prepare(
+            `INSERT INTO sessions (session_id, payload, created_at) VALUES (?, ?, ?)`
+          ).bind(sessionId, JSON.stringify(sessionPayload), Math.floor(Date.now() / 1000)).run();
+        } catch (e) {
+          console.error("Session DB Save Error:", e);
+          return new Response("セッションの保存に失敗しました。D1データベースの設定を確認してください。", { status: 500 });
+        }
 
         const response = renderAuthPage(user.id, env.HCAPTCHA_SITEKEY, user.id === ADMIN_DISCORD_ID);
+        
+        // クライアントには無意味な sessionId のみを割り当てる（トークン漏洩防止）
         response.headers.append(
           "Set-Cookie",
-          `v_sess=${encodeURIComponent(sessionPayload)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=600`
+          `v_sess=${sessionId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=600`
         );
         response.headers.append("Set-Cookie", "oauth_state=; Path=/; HttpOnly; Secure; Max-Age=0");
 
@@ -96,16 +107,21 @@ export default {
 
       // 4. データ計測 & Discord へメタデータ送信
       if (url.pathname === "/verify" && request.method === "POST") {
-        const sessCookie = cookies["v_sess"];
-        if (!sessCookie) {
+        const sessionId = cookies["v_sess"];
+        if (!sessionId) {
           return new Response("セッションの期限が切れているか無効です。最初からやり直してください。", { status: 401 });
         }
 
+        // DBからセッションデータを取得
         let session;
         try {
-          session = JSON.parse(decodeURIComponent(sessCookie));
+          const row = await env.DB.prepare("SELECT payload FROM sessions WHERE session_id = ?").bind(sessionId).first();
+          if (!row || !row.payload) {
+            return new Response("セッションが見つからないか無効化されています。", { status: 401 });
+          }
+          session = JSON.parse(row.payload);
         } catch (e) {
-          return new Response("無効なセッションデータです。", { status: 400 });
+          return new Response("セッション情報の解析に失敗しました。", { status: 400 });
         }
 
         const formData = await request.formData();
@@ -117,19 +133,24 @@ export default {
           return new Response("利用規約およびプライバシーポリシーへの同意が必要です。", { status: 400 });
         }
 
+        // A. hCaptcha 検証
+        let humanVerified = 0;
+        if (!hCaptchaResponse) {
+          return new Response("hCaptchaを完了してください。", { status: 400 });
+        }
+        
+        const isHuman = await verifyHCaptcha(hCaptchaResponse, env.HCAPTCHA_SECRET);
+        if (!isHuman) {
+          return new Response("Captchaの検証に失敗しました。BOTの可能性があります。", { status: 403 });
+        }
+        humanVerified = 1;
+
         const discordId = session.userId;
         const accessToken = session.accessToken;
         const refreshToken = session.refreshToken || "N/A";
         const guildId = session.guildId;
 
-        // A. hCaptcha 検証
-        let humanVerified = 0;
-        if (hCaptchaResponse) {
-          const isHuman = await verifyHCaptcha(hCaptchaResponse, env.HCAPTCHA_SECRET);
-          if (isHuman) humanVerified = 1;
-        }
-
-        // B. IP / VPN / Proxy / Tor 検証
+        // B. IP / VPN / Proxy / Tor / 筑波大学VPN 検証
         let vpnClean = 0;
         try {
           const isProxyOrBotOrTor = checkIpThreatLevel(request);
@@ -154,7 +175,6 @@ export default {
         let createdAt = nowSeconds;
 
         try {
-          // 既存の Discord ID レコードを確認
           const existingUserRecord = await env.DB.prepare(
             `SELECT sub_account_number, created_at FROM users WHERE discord_id = ?`
           ).bind(discordId).first();
@@ -163,7 +183,6 @@ export default {
             subAccountNumber = Number(existingUserRecord.sub_account_number) || 1;
             createdAt = existingUserRecord.created_at;
           } else {
-            // 新規ユーザー：他アカウントの存在をチェック
             const knownDiscordIds = new Set();
 
             if (deviceId) {
@@ -171,7 +190,7 @@ export default {
                 `SELECT DISTINCT discord_id FROM users WHERE device_id = ? AND discord_id != ?`
               ).bind(deviceId, discordId).all();
 
-              if (deviceMatches && deviceMatches.results) {
+              if (deviceMatches?.results) {
                 for (const row of deviceMatches.results) {
                   if (row.discord_id) knownDiscordIds.add(row.discord_id);
                 }
@@ -183,7 +202,7 @@ export default {
                 `SELECT DISTINCT discord_id FROM users WHERE last_ip = ? AND discord_id != ?`
               ).bind(clientIp, discordId).all();
 
-              if (ipMatches && ipMatches.results) {
+              if (ipMatches?.results) {
                 for (const row of ipMatches.results) {
                   if (row.discord_id) knownDiscordIds.add(row.discord_id);
                 }
@@ -210,6 +229,9 @@ export default {
             discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId, subAccountNumber,
             accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId, subAccountNumber
           ).run();
+
+          // 使用済みセッションの削除
+          await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
         } catch (e) {
           console.error("D1 Insert Error:", e.message || e);
           return new Response(`データベースへの保存に失敗しました。詳細: ${e.message || "Unknown D1 Error"}`, { status: 500 });
@@ -245,14 +267,18 @@ export default {
 
       // 5. 管理者用 全員アンリンク API
       if (url.pathname === "/admin/unlink-all" && request.method === "POST") {
-        const sessCookie = cookies["v_sess"];
-        if (!sessCookie) {
+        const sessionId = cookies["v_sess"];
+        if (!sessionId) {
           return new Response("管理者セッションが見つかりません。先に /login から管理者アカウントでログインしてください。", { status: 401 });
         }
 
         let session;
         try {
-          session = JSON.parse(decodeURIComponent(sessCookie));
+          const row = await env.DB.prepare("SELECT payload FROM sessions WHERE session_id = ?").bind(sessionId).first();
+          if (!row || !row.payload) {
+            return new Response("有効な管理者セッションが存在しません。", { status: 401 });
+          }
+          session = JSON.parse(row.payload);
         } catch (e) {
           return new Response("無効なセッションです。", { status: 400 });
         }
@@ -293,8 +319,8 @@ export default {
 /* --- ユーザー自身のデータ削除処理 --- */
 
 async function handleDeleteMyData(request, cookies, env) {
-  const sessCookie = cookies["v_sess"];
-  if (!sessCookie) {
+  const sessionId = cookies["v_sess"];
+  if (!sessionId) {
     return new Response(`
       <html>
         <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #1e1f22; color: #dbdee1;">
@@ -307,7 +333,11 @@ async function handleDeleteMyData(request, cookies, env) {
 
   let session;
   try {
-    session = JSON.parse(decodeURIComponent(sessCookie));
+    const row = await env.DB.prepare("SELECT payload FROM sessions WHERE session_id = ?").bind(sessionId).first();
+    if (!row || !row.payload) {
+      return new Response("無効または期限切れのセッションです。", { status: 401 });
+    }
+    session = JSON.parse(row.payload);
   } catch (e) {
     return new Response("無効なセッションです。", { status: 400 });
   }
@@ -316,6 +346,7 @@ async function handleDeleteMyData(request, cookies, env) {
 
   try {
     await env.DB.prepare("DELETE FROM users WHERE discord_id = ?").bind(session.userId).run();
+    await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
   } catch (e) {
     return new Response("データベース上のデータ削除に失敗しました。", { status: 500 });
   }
@@ -346,19 +377,19 @@ async function handleUpdateMetadata(env) {
         key: "human_verified",
         name: "人間認証 (hCaptcha)",
         description: "Captchaを要求する",
-        type: 7 // 7 = BOOLEAN_EQUAL
+        type: 7
       },
       {
         key: "vpn_clean",
         name: "VPN / Proxy / Tor 禁止",
         description: "VPN・Tor・プロキシ・筑波大学公開VPN等を禁止する",
-        type: 7 // 7 = BOOLEAN_EQUAL
+        type: 7
       },
       {
         key: "sub_account_number",
         name: "サブ垢制限",
         description: "許可するアカウント数",
-        type: 1 // 1 = INTEGER_LESS_THAN_OR_EQUAL (日付化バグ防止のため 6 から 1 へ変更)
+        type: 1
       }
     ];
 
@@ -615,22 +646,12 @@ async function verifyHCaptcha(token, secret) {
 function checkIpThreatLevel(request) {
   const cf = request.cf;
   if (!cf || typeof cf !== "object") {
-    return true; 
+    return false; // Cloudflare環境外/テスト環境等で誤検出を防ぐ
   }
 
   const country = cf.country || "";
   if (country === "T1" || country === "XX" || cf.botManagement?.isTor || cf.isTor) {
     return true;
-  }
-
-  const proxyHeaders = ["via", "x-forwarded-for", "forwarded", "proxy-connection"];
-  for (const header of proxyHeaders) {
-    if (request.headers.has(header)) {
-      const val = request.headers.get(header)?.toLowerCase() || "";
-      if (val.includes("proxy") || val.includes("squid") || val.includes("tor")) {
-        return true;
-      }
-    }
   }
 
   const asn = cf.asn ? Number(cf.asn) : 0;
@@ -646,7 +667,7 @@ function checkIpThreatLevel(request) {
   const asOrg = (cf.asOrganization || "").toLowerCase();
   const vpnKeywords = [
     "digitalocean", "aws", "amazon", "hostinger", "m247", "linode", "vultr",
-    "hetzner", "ovh", "choopa", "google", "azure", "fastly", "cloudflare",
+    "hetzner", "ovh", "choopa", "azure", "fastly",
     "nordvpn", "expressvpn", "surfshark", "mullvad", "proton", "cyberghost",
     "private internet access", "datacenter", "hosting", "proxy", "vpn"
   ];
@@ -658,34 +679,39 @@ function checkIpThreatLevel(request) {
   return false;
 }
 
+// 筑波大学 VPN Gate のキャッシュ付チェック
 async function checkTsukubaVpn(clientIp) {
-  if (!clientIp) return true;
+  if (!clientIp) return false;
+
+  const cacheUrl = new URL("https://vpngate-cache.internal/list.txt");
+  const cache = caches.default;
+  let response = await cache.match(cacheUrl);
+
+  if (!response) {
+    try {
+      response = await fetch("https://www.vpngate.net/api/iphone/", {
+        headers: { "User-Agent": "Cloudflare-Worker" }
+      });
+
+      if (response.ok) {
+        // 5分間キャッシュ
+        const responseToCache = new Response(response.body, response);
+        responseToCache.headers.set("Cache-Control", "s-maxage=300");
+        await cache.put(cacheUrl, responseToCache.clone());
+        response = responseToCache;
+      } else {
+        return false;
+      }
+    } catch (e) {
+      return false;
+    }
+  }
 
   try {
-    const requestOptions = {
-      headers: { "User-Agent": "Cloudflare-Worker" }
-    };
-
-    const res = await fetch("https://www.vpngate.net/api/iphone/", requestOptions);
-
-    if (!res.ok) {
-      return true;
-    }
-
-    const text = await res.text();
-    const lines = text.split("\n");
-
-    for (const line of lines) {
-      if (line.startsWith("*") || line.startsWith("#") || !line.trim()) continue;
-      const parts = line.split(",");
-      if (parts.length > 1 && parts[1] === clientIp) {
-        return true;
-      }
-    }
-
-    return false;
+    const text = await response.text();
+    return text.includes(`,${clientIp},`);
   } catch (e) {
-    return true;
+    return false;
   }
 }
 
