@@ -893,7 +893,7 @@ function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
         <h2>Discord 連携認証</h2>
         <p style="font-size: 14px; color: #dbdee1;">利用規約を確認し、Captcha を完了して送信してください。</p>
         
-        <form action="/verify" method="POST" id="verifyForm">
+        <form action="/verify" method="POST" id="verifyForm" onsubmit="document.getElementById('submitBtn').disabled = true;">
           <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
           <div class="h-captcha" data-sitekey="${escapeHtml(siteKey)}"></div>
 
