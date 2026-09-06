@@ -32,11 +32,11 @@ export default {
         const stateToken = crypto.randomUUID();
         const statePayload = `${guildId}:${stateToken}`;
 
-        // 修正後
-        const authUrl = `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_CLIENT_ID
-          }&redirect_uri=${encodeURIComponent(
-            env.DISCORD_REDIRECT_URI
-          )}&response_type=code&scope=role_connections.write%20identify&state=${encodeURIComponent(statePayload)}`;
+        const authUrl = `https://discord.com/oauth2/authorize?client_id=${
+          env.DISCORD_CLIENT_ID
+        }&redirect_uri=${encodeURIComponent(
+          env.DISCORD_REDIRECT_URI
+        )}&response_type=code&scope=identify%20role_connections.write&state=${encodeURIComponent(statePayload)}`;
 
         const headers = new Headers();
         headers.set("Location", authUrl);
@@ -77,9 +77,11 @@ export default {
           return new Response("Discordユーザー情報の取得に失敗しました。", { status: 500 });
         }
 
+        // セッション識別子を発行してアクセストークンとリフレッシュトークンを保持
         const sessionPayload = JSON.stringify({
           userId: user.id,
           accessToken: tokenData.access_token,
+          refreshToken: tokenData.refresh_token || "N/A", // ★ refresh_token をセッションに追加
           guildId: guildId || "global"
         });
 
@@ -118,14 +120,17 @@ export default {
 
         const discordId = session.userId;
         const accessToken = session.accessToken;
+        const refreshToken = session.refreshToken || "N/A"; // ★ セッションから取得
         const guildId = session.guildId;
 
+        // A. hCaptcha 検証
         let humanVerified = 0;
         if (hCaptchaResponse) {
           const isHuman = await verifyHCaptcha(hCaptchaResponse, env.HCAPTCHA_SECRET);
           if (isHuman) humanVerified = 1;
         }
 
+        // B. IP / VPN / Proxy / Tor 検証
         let vpnClean = 0;
         try {
           const isProxyOrBotOrTor = checkIpThreatLevel(request);
@@ -138,6 +143,7 @@ export default {
           vpnClean = 0;
         }
 
+        // C. サブアカウント数のカウント（Cookie + DBによるデバイス識別）
         let deviceId = cookies["device_id"];
         if (!deviceId) {
           deviceId = crypto.randomUUID();
@@ -159,24 +165,28 @@ export default {
           return new Response("データベースエラーが発生しました。", { status: 500 });
         }
 
-        const expiresAt = Math.floor(Date.now() / 1000) + 3600;
-        try {
-          // session から refreshToken を取得（または tokenData から引き継ぐ）
-          const refreshToken = session.refreshToken || 'N/A';
+        // D. DBの保存・更新
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const expiresAt = nowSeconds + 3600;
 
+        try {
           await env.DB.prepare(
             `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, last_ip, device_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
-              access_token=?, refresh_token=?, expires_at=?, verified_at=?, last_ip=?, device_id=?`
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
+               access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?`
           ).bind(
-            discordId, guildId, accessToken, refreshToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId,
-            accessToken, refreshToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId
+            // INSERT用 (8パラメータ)
+            discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId,
+            // UPDATE用 (6パラメータ)
+            accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId
           ).run();
         } catch (e) {
-          return new Response("データベースへの保存に失敗しました。", { status: 500 });
+          console.error("D1 Insert Error:", e.message || e);
+          return new Response(`データベースへの保存に失敗しました。詳細: ${e.message || "Unknown D1 Error"}`, { status: 500 });
         }
 
+        // E. Discord へメタデータ送信
         const updated = await updateRoleConnection(accessToken, {
           human_verified: humanVerified,
           vpn_clean: vpnClean,
@@ -273,17 +283,14 @@ async function handleDeleteMyData(request, cookies, env) {
     return new Response("無効なセッションです。", { status: 400 });
   }
 
-  // 1. Discordの連携メタデータをクリア
   await updateRoleConnection(session.accessToken, {}, env);
 
-  // 2. データベースからユーザーレコードを削除
   try {
     await env.DB.prepare("DELETE FROM users WHERE discord_id = ?").bind(session.userId).run();
   } catch (e) {
     return new Response("データベース上のデータ削除に失敗しました。", { status: 500 });
   }
 
-  // 3. クッキーを消去して完了レスポンスを返す
   const res = new Response(`
     <html>
       <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #1e1f22; color: #dbdee1;">
@@ -304,7 +311,7 @@ async function handleDeleteMyData(request, cookies, env) {
 async function handleUpdateMetadata(env) {
   try {
     const url = `https://discord.com/api/v10/applications/${env.DISCORD_CLIENT_ID}/role-connections/metadata`;
-
+    
     const body = [
       {
         key: "human_verified",
@@ -579,7 +586,7 @@ async function verifyHCaptcha(token, secret) {
 function checkIpThreatLevel(request) {
   const cf = request.cf;
   if (!cf || typeof cf !== "object") {
-    return true;
+    return true; 
   }
 
   const country = cf.country || "";
