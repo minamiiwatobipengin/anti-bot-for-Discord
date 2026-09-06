@@ -410,18 +410,33 @@ async function consumeSession(env, sessionId) {
 
 async function purgeExpiredUsers(env) {
   const { results } = await env.DB.prepare(
-    "SELECT discord_id, guild_id, access_token FROM users WHERE expires_at <= ?"
+    "SELECT discord_id, refresh_token FROM users WHERE expires_at <= ?"
   ).bind(Math.floor(Date.now() / 1000)).all();
+  const refreshTokensByUser = new Map();
 
   for (const user of results || []) {
-    const accessToken = await decryptSecret(user.access_token, env.SESSION_ENCRYPTION_KEY);
-    if (!accessToken || !await updateRoleConnection(accessToken, {}, env)) {
-      continue;
+    if (!refreshTokensByUser.has(user.discord_id)) {
+      refreshTokensByUser.set(user.discord_id, user.refresh_token);
     }
+  }
+
+  for (const [discordId, storedRefreshToken] of refreshTokensByUser) {
+    const refreshToken = await decryptSecret(storedRefreshToken, env.SESSION_ENCRYPTION_KEY);
+    if (!refreshToken || refreshToken === "N/A") continue;
+
+    const tokenData = await refreshDiscordToken(refreshToken, env);
+    if (!tokenData?.access_token) continue;
+
+    const nextRefreshToken = tokenData.refresh_token || refreshToken;
+    const storedAccessToken = await encryptSecret(tokenData.access_token, env.SESSION_ENCRYPTION_KEY);
+    const storedNextRefreshToken = await encryptSecret(nextRefreshToken, env.SESSION_ENCRYPTION_KEY);
+    const expiresAt = Math.floor(Date.now() / 1000) + (Number(tokenData.expires_in) || 3600);
 
     await env.DB.prepare(
-      "DELETE FROM users WHERE discord_id = ? AND guild_id = ? AND expires_at <= ?"
-    ).bind(user.discord_id, user.guild_id, Math.floor(Date.now() / 1000)).run();
+      `UPDATE users
+       SET access_token = ?, refresh_token = ?, expires_at = ?
+       WHERE discord_id = ?`
+    ).bind(storedAccessToken, storedNextRefreshToken, expiresAt, discordId).run();
   }
 }
 
@@ -1049,6 +1064,28 @@ async function exchangeCode(code, env) {
       grant_type: "authorization_code",
       code,
       redirect_uri: env.DISCORD_REDIRECT_URI
+    });
+
+    const res = await fetchWithTimeout("https://discord.com/api/v10/oauth2/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString()
+    });
+
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    return null;
+  }
+}
+
+async function refreshDiscordToken(refreshToken, env) {
+  try {
+    const params = new URLSearchParams({
+      client_id: env.DISCORD_CLIENT_ID,
+      client_secret: env.DISCORD_CLIENT_SECRET,
+      grant_type: "refresh_token",
+      refresh_token: refreshToken
     });
 
     const res = await fetchWithTimeout("https://discord.com/api/v10/oauth2/token", {
