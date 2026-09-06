@@ -148,7 +148,7 @@ export default {
           deviceId = crypto.randomUUID();
         }
 
-        // D. 厳密なメイン/サブアカウント順位判定ロジック
+        // D. 厳密なメイン/サブアカウント順位判定ロジック（D1対応版）
         let subAccountNumber = 1;
         const nowSeconds = Math.floor(Date.now() / 1000);
         let createdAt = nowSeconds;
@@ -160,32 +160,45 @@ export default {
           ).bind(discordId).first();
 
           if (existingUserRecord) {
-            // 既存ユーザーの場合は、過去に確定した順位と初回作成日時を維持
-            subAccountNumber = existingUserRecord.sub_account_number;
+            // 既存ユーザーの場合は過去に決定した順位と初回作成日時を自動維持
+            subAccountNumber = Number(existingUserRecord.sub_account_number) || 1;
             createdAt = existingUserRecord.created_at;
           } else {
-            // 新規ユーザーの場合：過去の別アカウントの存在を検索
-            let relatedAccounts;
+            // 新規ユーザーの場合：重複を排除して一致する過去の全 Discord ID を抽出
+            const knownDiscordIds = new Set();
 
-            if (vpnClean === 0) {
-              // プロキシ/VPN使用時 (vpnClean === 0): IP一致を除外し Cookie (device_id) のみで判定
-              relatedAccounts = await env.DB.prepare(
-                `SELECT COUNT(DISTINCT discord_id) as count FROM users WHERE device_id = ?`
-              ).bind(deviceId).first();
-            } else {
-              // 通常時 (vpnClean === 1): Cookie (device_id) または IP (last_ip) のいずれか一致で判定
-              relatedAccounts = await env.DB.prepare(
-                `SELECT COUNT(DISTINCT discord_id) as count FROM users WHERE device_id = ? OR last_ip = ?`
-              ).bind(deviceId, clientIp).first();
+            // 1. Cookie (device_id) で検索
+            if (deviceId) {
+              const deviceMatches = await env.DB.prepare(
+                `SELECT DISTINCT discord_id FROM users WHERE device_id = ? AND discord_id != ?`
+              ).bind(deviceId, discordId).all();
+
+              if (deviceMatches && deviceMatches.results) {
+                for (const row of deviceMatches.results) {
+                  if (row.discord_id) knownDiscordIds.add(row.discord_id);
+                }
+              }
             }
 
-            const existingCount = (relatedAccounts && relatedAccounts.count) ? Number(relatedAccounts.count) : 0;
-            // 既存のアカウント数 + 1 を本アカウントの順位とする
-            subAccountNumber = existingCount + 1;
+            // 2. プロキシ未検出時 (vpnClean === 1) は IP (last_ip) でも検索
+            if (vpnClean === 1 && clientIp) {
+              const ipMatches = await env.DB.prepare(
+                `SELECT DISTINCT discord_id FROM users WHERE last_ip = ? AND discord_id != ?`
+              ).bind(clientIp, discordId).all();
+
+              if (ipMatches && ipMatches.results) {
+                for (const row of ipMatches.results) {
+                  if (row.discord_id) knownDiscordIds.add(row.discord_id);
+                }
+              }
+            }
+
+            // 一致した他アカウントの数 + 1 を自身の順位とする
+            subAccountNumber = knownDiscordIds.size + 1;
           }
         } catch (e) {
           console.error("Sub account calculation error:", e);
-          return new Response("データベース判定処理でエラーが発生しました。", { status: 500 });
+          return new Response(`データベース判定処理でエラーが発生しました。詳細: ${e.message || e}`, { status: 500 });
         }
 
         // E. DBへの保存・更新
