@@ -191,7 +191,11 @@ export default {
           return new Response("Discord Linked Role メタデータの更新に失敗しました。", { status: 500 });
         }
 
-        const res = new Response("<h1>このタブを安全に閉じることができます</h1><script>window.close()</script>", {
+        const res = new Response(`<html>
+            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+              <h1>このタブを安全に閉じることができます</h1><script>window.close()</script>
+            </body>
+          </html>`, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
 
