@@ -81,7 +81,7 @@ export default {
         const sessionPayload = JSON.stringify({
           userId: user.id,
           accessToken: tokenData.access_token,
-          refreshToken: tokenData.refresh_token || "N/A", // ★ refresh_token をセッションに追加
+          refreshToken: tokenData.refresh_token || "N/A",
           guildId: guildId || "global"
         });
 
@@ -120,7 +120,7 @@ export default {
 
         const discordId = session.userId;
         const accessToken = session.accessToken;
-        const refreshToken = session.refreshToken || "N/A"; // ★ セッションから取得
+        const refreshToken = session.refreshToken || "N/A";
         const guildId = session.guildId;
 
         // A. hCaptcha 検証
@@ -143,29 +143,45 @@ export default {
           vpnClean = 0;
         }
 
-        // C. サブアカウント数のカウント（Cookie + DBによるデバイス識別）
+        // C. デバイス識別子の設定・取得
         let deviceId = cookies["device_id"];
         if (!deviceId) {
           deviceId = crypto.randomUUID();
         }
 
+        // D. グローバルでのメイン/サブアカウント判定
         let subAccountNumber = 1;
         try {
-          const existingRecords = await env.DB.prepare(
-            "SELECT discord_id, device_id FROM users WHERE guild_id = ? AND verified_at IS NOT NULL"
-          ).bind(guildId).all();
+          // 同じ device_id で過去に認証済みのユーザー一覧（古い順＝最初に認証された順）を取得
+          const existingAccounts = await env.DB.prepare(
+            `SELECT DISTINCT discord_id, MIN(verified_at) as first_verified 
+             FROM users 
+             WHERE device_id = ? AND verified_at IS NOT NULL 
+             GROUP BY discord_id 
+             ORDER BY first_verified ASC`
+          ).bind(deviceId).all();
 
-          if (existingRecords && existingRecords.results) {
-            const otherAccounts = existingRecords.results.filter(
-              (r) => r.discord_id !== discordId && (r.device_id === deviceId)
-            );
-            subAccountNumber = otherAccounts.length + 1;
+          if (existingAccounts && existingAccounts.results && existingAccounts.results.length > 0) {
+            const list = existingAccounts.results;
+            const index = list.findIndex(acc => acc.discord_id === discordId);
+
+            if (index !== -1) {
+              // 既に一度認証したことがあるアカウントの場合：初認証の古い順のインデックス + 1
+              subAccountNumber = index + 1;
+            } else {
+              // 初めてこのデバイスで認証する新規アカウントの場合：登録済みアカウント数 + 1
+              subAccountNumber = list.length + 1;
+            }
+          } else {
+            // このデバイスで完全初認証の場合は 1（メイン）
+            subAccountNumber = 1;
           }
         } catch (e) {
+          console.error("Sub account calculation error:", e);
           return new Response("データベースエラーが発生しました。", { status: 500 });
         }
 
-        // D. DBの保存・更新
+        // E. DBの保存・更新
         const nowSeconds = Math.floor(Date.now() / 1000);
         const expiresAt = nowSeconds + 3600;
 
@@ -186,7 +202,7 @@ export default {
           return new Response(`データベースへの保存に失敗しました。詳細: ${e.message || "Unknown D1 Error"}`, { status: 500 });
         }
 
-        // E. Discord へメタデータ送信
+        // F. Discord へメタデータ送信
         const updated = await updateRoleConnection(accessToken, {
           human_verified: humanVerified,
           vpn_clean: vpnClean,
@@ -315,20 +331,20 @@ async function handleUpdateMetadata(env) {
     const body = [
       {
         key: "human_verified",
-        name: "人間認証 (hCaptcha) パス",
-        description: "Captchaをクリアしているか",
+        name: "人間認証 (hCaptcha)",
+        description: "Captchaを要求する",
         type: 7
       },
       {
         key: "vpn_clean",
-        name: "VPN / Proxy / Tor 未使用",
-        description: "VPN・Tor・プロキシ・筑波大学VPN等を使用していないか",
+        name: "VPN / Proxy / Tor 禁止",
+        description: "VPN・Tor・プロキシ・筑波大学公開VPN等を禁止する",
         type: 7
       },
       {
         key: "sub_account_number",
-        name: "アカウント順位 (サブ垢制限)",
-        description: "メイン=1, サブ1=2, サブ2=3... (例: 1以下に設定でメインのみ許可)",
+        name: "サブ垢制限",
+        description: "許可するアカウント数",
         type: 6
       }
     ];
