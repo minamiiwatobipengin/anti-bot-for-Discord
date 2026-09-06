@@ -8,12 +8,17 @@ export default {
 
       // 0-1. プライバシーポリシー
       if (url.pathname === "/privacy") {
-        return renderPrivacyPolicy();
+        return renderPrivacyPolicy(url.origin);
       }
 
       // 0-2. 利用規約
       if (url.pathname === "/terms") {
         return renderTermsOfService();
+      }
+
+      // 0-3. ユーザー自身のデータ削除リクエスト
+      if (url.pathname === "/delete-my-data") {
+        return await handleDeleteMyData(request, cookies, env);
       }
 
       // 1. Linked Role メタデータ定義更新 API (Bot管理者用)
@@ -33,7 +38,6 @@ export default {
           env.DISCORD_REDIRECT_URI
         )}&response_type=code&scope=identify%20role_connections.write&state=${encodeURIComponent(statePayload)}`;
 
-        // Response.redirectではなくnew Response()を使用してImmutable Headerエラーを回避
         const headers = new Headers();
         headers.set("Location", authUrl);
         headers.append(
@@ -56,7 +60,6 @@ export default {
           return new Response("認証パラメータが不足しています。", { status: 400 });
         }
 
-        // State パラメータの検証 (CSRF対策)
         const [guildId, stateToken] = state.split(":");
         const savedState = cookies["oauth_state"];
 
@@ -64,19 +67,16 @@ export default {
           return new Response("無効なセッションまたはCSRFトークンの検証に失敗しました。", { status: 403 });
         }
 
-        // トークン取得
         const tokenData = await exchangeCode(code, env);
         if (!tokenData || !tokenData.access_token) {
           return new Response("Discordトークンの取得に失敗しました。", { status: 500 });
         }
 
-        // ユーザー情報取得
         const user = await getDiscordUser(tokenData.access_token);
         if (!user || !user.id) {
           return new Response("Discordユーザー情報の取得に失敗しました。", { status: 500 });
         }
 
-        // セッション識別子を発行してアクセストークンを一時保持
         const sessionPayload = JSON.stringify({
           userId: user.id,
           accessToken: tokenData.access_token,
@@ -88,7 +88,6 @@ export default {
           "Set-Cookie",
           `v_sess=${encodeURIComponent(sessionPayload)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=600`
         );
-        // 使用済み oauth_state の削除
         response.headers.append("Set-Cookie", "oauth_state=; Path=/; HttpOnly; Secure; Max-Age=0");
 
         return response;
@@ -113,7 +112,6 @@ export default {
         const termsAgreed = formData.get("terms_agreed");
         const clientIp = request.headers.get("cf-connecting-ip") || "";
 
-        // 利用規約同意チェックの検証
         if (!termsAgreed) {
           return new Response("利用規約およびプライバシーポリシーへの同意が必要です。", { status: 400 });
         }
@@ -122,14 +120,12 @@ export default {
         const accessToken = session.accessToken;
         const guildId = session.guildId;
 
-        // A. hCaptcha 検証
         let humanVerified = 0;
         if (hCaptchaResponse) {
           const isHuman = await verifyHCaptcha(hCaptchaResponse, env.HCAPTCHA_SECRET);
           if (isHuman) humanVerified = 1;
         }
 
-        // B. IP / VPN / Proxy / Tor 検証
         let vpnClean = 0;
         try {
           const isProxyOrBotOrTor = checkIpThreatLevel(request);
@@ -142,7 +138,6 @@ export default {
           vpnClean = 0;
         }
 
-        // C. サブアカウント数のカウント（Cookie + DBによるデバイス識別）
         let deviceId = cookies["device_id"];
         if (!deviceId) {
           deviceId = crypto.randomUUID();
@@ -164,7 +159,6 @@ export default {
           return new Response("データベースエラーが発生しました。", { status: 500 });
         }
 
-        // D. DBの保存・更新
         const expiresAt = Math.floor(Date.now() / 1000) + 3600;
         try {
           await env.DB.prepare(
@@ -180,7 +174,6 @@ export default {
           return new Response("データベースへの保存に失敗しました。", { status: 500 });
         }
 
-        // E. Discord へメタデータ送信
         const updated = await updateRoleConnection(accessToken, {
           human_verified: humanVerified,
           vpn_clean: vpnClean,
@@ -199,7 +192,6 @@ export default {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
 
-        // 端末識別用Cookieのセット（有効期限1年）およびセッションCookieの消去
         res.headers.append(
           "Set-Cookie",
           `device_id=${deviceId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`
@@ -209,7 +201,7 @@ export default {
         return res;
       }
 
-      // 5. 管理者用 全員アンリンク API (管理者ID権限チェック付き)
+      // 5. 管理者用 全員アンリンク API
       if (url.pathname === "/admin/unlink-all" && request.method === "POST") {
         const sessCookie = cookies["v_sess"];
         if (!sessCookie) {
@@ -227,14 +219,12 @@ export default {
           return new Response("アクセス権限がありません。管理者IDのみ実行可能です。", { status: 403 });
         }
 
-        // DBから全ユーザーのアクセストークンを取得
         const { results } = await env.DB.prepare("SELECT discord_id, access_token FROM users").all();
         let successCount = 0;
         let failCount = 0;
 
         if (results && results.length > 0) {
           for (const user of results) {
-            // メタデータを空にしてアンリンク状態にする
             const ok = await updateRoleConnection(user.access_token, {}, env);
             if (ok) {
               successCount++;
@@ -244,7 +234,6 @@ export default {
           }
         }
 
-        // DBの全認証情報をクリア
         await env.DB.prepare("DELETE FROM users").run();
 
         return new Response(`[管理者処理完了]\nアンリンク成功: ${successCount}件\n失敗(トークン切れ等): ${failCount}件\nDBの検証データを削除しました。`, {
@@ -258,6 +247,54 @@ export default {
     }
   }
 };
+
+/* --- ユーザー自身のデータ削除処理 --- */
+
+async function handleDeleteMyData(request, cookies, env) {
+  const sessCookie = cookies["v_sess"];
+  if (!sessCookie) {
+    return new Response(`
+      <html>
+        <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #1e1f22; color: #dbdee1;">
+          <h2>認証情報が見つかりません</h2>
+          <p>データを削除するには、一度 <a href="/login" style="color: #00a8fc;">ログイン (認証)</a> を行う必要があります。</p>
+        </body>
+      </html>
+    `, { headers: { "Content-Type": "text/html; charset=utf-8" }, status: 401 });
+  }
+
+  let session;
+  try {
+    session = JSON.parse(decodeURIComponent(sessCookie));
+  } catch (e) {
+    return new Response("無効なセッションです。", { status: 400 });
+  }
+
+  // 1. Discordの連携メタデータをクリア
+  await updateRoleConnection(session.accessToken, {}, env);
+
+  // 2. データベースからユーザーレコードを削除
+  try {
+    await env.DB.prepare("DELETE FROM users WHERE discord_id = ?").bind(session.userId).run();
+  } catch (e) {
+    return new Response("データベース上のデータ削除に失敗しました。", { status: 500 });
+  }
+
+  // 3. クッキーを消去して完了レスポンスを返す
+  const res = new Response(`
+    <html>
+      <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #1e1f22; color: #dbdee1;">
+        <h1>データ削除完了</h1>
+        <p>あなたの認証データおよびDiscord連携情報を正常に削除しました。</p>
+      </body>
+    </html>
+  `, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+
+  res.headers.append("Set-Cookie", "v_sess=; Path=/; HttpOnly; Secure; Max-Age=0");
+  res.headers.append("Set-Cookie", "device_id=; Path=/; HttpOnly; Secure; Max-Age=0");
+
+  return res;
+}
 
 /* --- メタデータ定義更新 --- */
 
@@ -372,7 +409,7 @@ function renderAuthPage(userId, siteKey, isAdmin = false) {
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
-function renderPrivacyPolicy() {
+function renderPrivacyPolicy(origin) {
   const html = `
     <!DOCTYPE html>
     <html lang="ja">
@@ -384,6 +421,8 @@ function renderPrivacyPolicy() {
         body { font-family: sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: 0 auto; background: #1e1f22; color: #dbdee1; }
         .container { background: #2b2d31; padding: 30px; border-radius: 8px; }
         h1 { border-bottom: 1px solid #4e5058; padding-bottom: 10px; }
+        a { color: #00a8fc; text-decoration: none; }
+        a:hover { text-decoration: underline; }
       </style>
     </head>
     <body>
@@ -408,6 +447,14 @@ function renderPrivacyPolicy() {
 
         <h3>3. 情報の管理・第三者提供</h3>
         <p>取得した情報は認証・ロール付与に必要な目的以外には使用せず、法令に基づく場合を除き第三者へ開示・提供することはありません。</p>
+
+        <h3>4. データの削除・連携解除</h3>
+        <p>ユーザーはいつでも自身の保存データを完全に削除することができます。</p>
+        <p>データの削除を希望される場合は、ログインを行った状態で以下の削除専用リンクにアクセスしてください。</p>
+        <p style="background: #1e1f22; padding: 10px; border-radius: 4px;">
+          データ削除URL: <a href="${origin}/delete-my-data">${origin}/delete-my-data</a>
+        </p>
+        <p style="font-size: 13px; color: #949ba4;">※ 削除を実行すると、データベースに保存された情報およびDiscord上の連携メタデータがクリアされます。</p>
       </div>
     </body>
     </html>
