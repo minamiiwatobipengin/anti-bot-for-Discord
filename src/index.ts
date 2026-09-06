@@ -148,26 +148,24 @@ export default {
           deviceId = crypto.randomUUID();
         }
 
-        // D. 厳密なメイン/サブアカウント順位判定ロジック（D1対応版）
+        // D. メイン/サブアカウント順位判定ロジック
         let subAccountNumber = 1;
         const nowSeconds = Math.floor(Date.now() / 1000);
         let createdAt = nowSeconds;
 
         try {
-          // 既にこの Discord ID のレコードが存在するか確認
+          // 既存の Discord ID レコードを確認
           const existingUserRecord = await env.DB.prepare(
             `SELECT sub_account_number, created_at FROM users WHERE discord_id = ?`
           ).bind(discordId).first();
 
           if (existingUserRecord) {
-            // 既存ユーザーの場合は過去に決定した順位と初回作成日時を自動維持
             subAccountNumber = Number(existingUserRecord.sub_account_number) || 1;
             createdAt = existingUserRecord.created_at;
           } else {
-            // 新規ユーザーの場合：重複を排除して一致する過去の全 Discord ID を抽出
+            // 新規ユーザー：他アカウントの存在をチェック
             const knownDiscordIds = new Set();
 
-            // 1. Cookie (device_id) で検索
             if (deviceId) {
               const deviceMatches = await env.DB.prepare(
                 `SELECT DISTINCT discord_id FROM users WHERE device_id = ? AND discord_id != ?`
@@ -180,7 +178,6 @@ export default {
               }
             }
 
-            // 2. プロキシ未検出時 (vpnClean === 1) は IP (last_ip) でも検索
             if (vpnClean === 1 && clientIp) {
               const ipMatches = await env.DB.prepare(
                 `SELECT DISTINCT discord_id FROM users WHERE last_ip = ? AND discord_id != ?`
@@ -193,7 +190,6 @@ export default {
               }
             }
 
-            // 一致した他アカウントの数 + 1 を自身の順位とする
             subAccountNumber = knownDiscordIds.size + 1;
           }
         } catch (e) {
@@ -211,9 +207,7 @@ export default {
              ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
                access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?, sub_account_number = ?`
           ).bind(
-            // INSERT用 (10パラメータ)
             discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId, subAccountNumber,
-            // UPDATE用 (7パラメータ)
             accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId, subAccountNumber
           ).run();
         } catch (e) {
@@ -350,21 +344,21 @@ async function handleUpdateMetadata(env) {
     const body = [
       {
         key: "human_verified",
-        name: "人間認証 (hCaptcha) パス",
-        description: "Captchaをクリアしているか",
-        type: 7
+        name: "人間認証 (hCaptcha)",
+        description: "Captchaを要求する",
+        type: 7 // 7 = BOOLEAN_EQUAL
       },
       {
         key: "vpn_clean",
-        name: "VPN / Proxy / Tor 未使用",
-        description: "VPN・Tor・プロキシ・筑波大学VPN等を使用していないか",
-        type: 7
+        name: "VPN / Proxy / Tor 禁止",
+        description: "VPN・Tor・プロキシ・筑波大学公開VPN等を禁止する",
+        type: 7 // 7 = BOOLEAN_EQUAL
       },
       {
         key: "sub_account_number",
-        name: "アカウント順位 (サブ垢制限)",
-        description: "メイン=1, サブ1=2, サブ2=3... (例: 1以下に設定でメインのみ許可)",
-        type: 6
+        name: "サブ垢制限",
+        description: "許可するアカウント数",
+        type: 1 // 1 = INTEGER_LESS_THAN_OR_EQUAL (日付化バグ防止のため 6 から 1 へ変更)
       }
     ];
 
