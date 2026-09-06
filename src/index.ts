@@ -1,4 +1,6 @@
 const ADMIN_DISCORD_ID = "1506950854249418765";
+const SESSION_TTL_SECONDS = 600;
+const MAX_GUILD_ID_LENGTH = 20;
 
 export default {
   async fetch(request, env) {
@@ -8,7 +10,7 @@ export default {
 
       // 0-1. プライバシーポリシー
       if (url.pathname === "/privacy") {
-        return renderPrivacyPolicy(url.origin);
+        return renderPrivacyPolicy(new URL(env.DISCORD_REDIRECT_URI).origin);
       }
 
       // 0-2. 利用規約
@@ -22,13 +24,20 @@ export default {
       }
 
       // 1. Linked Role メタデータ定義更新 API (Bot管理者用)
-      if (url.pathname === "/update-metadata") {
-        return await handleUpdateMetadata(env);
+      if (url.pathname === "/update-metadata" && request.method === "POST") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `metadata:${getClientIp(request)}`)) {
+          return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+        }
+        return await handleUpdateMetadata(request, cookies, env);
       }
 
       // 2. OAuth2 認証開始
       if (url.pathname === "/login") {
-        const guildId = url.searchParams.get("guild_id") || "global";
+        if (!await enforceRateLimit(env.LOGIN_RATE_LIMITER, getClientIp(request))) {
+          return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+        }
+        const requestedGuildId = url.searchParams.get("guild_id") || "global";
+        const guildId = isValidGuildId(requestedGuildId) ? requestedGuildId : "global";
         const stateToken = crypto.randomUUID();
         const statePayload = `${guildId}:${stateToken}`;
 
@@ -50,6 +59,9 @@ export default {
 
       // 3. OAuth2 コールバック受取 & 認証画面表示
       if (url.pathname === "/callback") {
+        if (!await enforceRateLimit(env.CALLBACK_RATE_LIMITER, getClientIp(request))) {
+          return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+        }
         const code = url.searchParams.get("code");
         const state = url.searchParams.get("state");
 
@@ -57,10 +69,12 @@ export default {
           return new Response("認証パラメータが不足しています。", { status: 400 });
         }
 
-        const [guildId, stateToken] = state.split(":");
+        const stateParts = state.split(":");
+        const stateToken = stateParts.pop();
+        const guildId = stateParts.join(":") || "global";
         const savedState = cookies["oauth_state"];
 
-        if (!savedState || savedState !== stateToken) {
+        if (!savedState || !stateToken || savedState !== stateToken || !isValidGuildId(guildId)) {
           return new Response("無効なセッションまたはCSRFトークンの検証に失敗しました。", { status: 403 });
         }
 
@@ -78,9 +92,10 @@ export default {
         const sessionId = crypto.randomUUID();
         const sessionPayload = {
           userId: user.id,
-          accessToken: tokenData.access_token,
-          refreshToken: tokenData.refresh_token || "N/A",
-          guildId: guildId || "global"
+          accessToken: await encryptSecret(tokenData.access_token, env.SESSION_ENCRYPTION_KEY),
+          refreshToken: await encryptSecret(tokenData.refresh_token || "N/A", env.SESSION_ENCRYPTION_KEY),
+          guildId,
+          csrfToken: crypto.randomUUID()
         };
 
         // D1 sessions テーブルに安全に保存
@@ -93,12 +108,12 @@ export default {
           return new Response("セッションの保存に失敗しました。D1データベースの設定を確認してください。", { status: 500 });
         }
 
-        const response = renderAuthPage(user.id, env.HCAPTCHA_SITEKEY, user.id === ADMIN_DISCORD_ID);
+        const response = renderAuthPage(user.id, env.HCAPTCHA_SITEKEY, user.id === ADMIN_DISCORD_ID, sessionPayload.csrfToken);
         
         // クライアントには無意味な sessionId のみを割り当てる（トークン漏洩防止）
         response.headers.append(
           "Set-Cookie",
-          `v_sess=${sessionId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=600`
+          `v_sess=${sessionId}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`
         );
         response.headers.append("Set-Cookie", "oauth_state=; Path=/; HttpOnly; Secure; Max-Age=0");
 
@@ -107,29 +122,27 @@ export default {
 
       // 4. データ計測 & Discord へメタデータ送信
       if (url.pathname === "/verify" && request.method === "POST") {
+        if (!await enforceRateLimit(env.VERIFY_RATE_LIMITER, getClientIp(request))) {
+          return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+        }
         const sessionId = cookies["v_sess"];
         if (!sessionId) {
           return new Response("セッションの期限が切れているか無効です。最初からやり直してください。", { status: 401 });
         }
 
         // DBからセッションデータを取得
-        let session;
-        try {
-          const row = await env.DB.prepare("SELECT payload FROM sessions WHERE session_id = ?").bind(sessionId).first();
-          if (!row || !row.payload) {
-            return new Response("セッションが見つからないか無効化されています。", { status: 401 });
-          }
-          session = JSON.parse(row.payload);
-        } catch (e) {
-          return new Response("セッション情報の解析に失敗しました。", { status: 400 });
+        const session = await getSession(env, sessionId);
+        if (!session) {
+          return new Response("セッションが見つからないか期限切れです。", { status: 401 });
         }
 
         const formData = await request.formData();
         const hCaptchaResponse = formData.get("h-captcha-response");
         const termsAgreed = formData.get("terms_agreed");
+        const csrfToken = formData.get("csrf_token");
         const clientIp = request.headers.get("cf-connecting-ip") || "";
 
-        if (!termsAgreed) {
+        if (!termsAgreed || typeof csrfToken !== "string" || csrfToken !== session.csrfToken) {
           return new Response("利用規約およびプライバシーポリシーへの同意が必要です。", { status: 400 });
         }
 
@@ -145,10 +158,19 @@ export default {
         }
         humanVerified = 1;
 
+        const consumeResult = await env.DB.prepare(
+          "DELETE FROM sessions WHERE session_id = ?"
+        ).bind(sessionId).run();
+        if (!consumeResult?.meta || consumeResult.meta.changes !== 1) {
+          return new Response("セッションがすでに使用済みか無効です。", { status: 401 });
+        }
+
         const discordId = session.userId;
         const accessToken = session.accessToken;
         const refreshToken = session.refreshToken || "N/A";
         const guildId = session.guildId;
+        const storedAccessToken = await encryptSecret(accessToken, env.SESSION_ENCRYPTION_KEY);
+        const storedRefreshToken = await encryptSecret(refreshToken, env.SESSION_ENCRYPTION_KEY);
 
         // B. IP / VPN / Proxy / Tor / 筑波大学VPN 検証
         let vpnClean = 0;
@@ -213,7 +235,7 @@ export default {
           }
         } catch (e) {
           console.error("Sub account calculation error:", e);
-          return new Response(`データベース判定処理でエラーが発生しました。詳細: ${e.message || e}`, { status: 500 });
+          return new Response("データベース判定処理でエラーが発生しました。", { status: 500 });
         }
 
         // E. DBへの保存・更新
@@ -226,15 +248,13 @@ export default {
              ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
                access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?, sub_account_number = ?`
           ).bind(
-            discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId, subAccountNumber,
-            accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId, subAccountNumber
+            discordId, guildId, storedAccessToken, storedRefreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId, subAccountNumber,
+            storedAccessToken, storedRefreshToken, expiresAt, nowSeconds, clientIp, deviceId, subAccountNumber
           ).run();
 
-          // 使用済みセッションの削除
-          await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
         } catch (e) {
-          console.error("D1 Insert Error:", e.message || e);
-          return new Response(`データベースへの保存に失敗しました。詳細: ${e.message || "Unknown D1 Error"}`, { status: 500 });
+          console.error("D1 Insert Error");
+          return new Response("データベースへの保存に失敗しました。", { status: 500 });
         }
 
         // F. Discord へメタデータ送信
@@ -267,23 +287,20 @@ export default {
 
       // 5. 管理者用 全員アンリンク API
       if (url.pathname === "/admin/unlink-all" && request.method === "POST") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `unlink:${getClientIp(request)}`)) {
+          return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+        }
         const sessionId = cookies["v_sess"];
         if (!sessionId) {
           return new Response("管理者セッションが見つかりません。先に /login から管理者アカウントでログインしてください。", { status: 401 });
         }
 
-        let session;
-        try {
-          const row = await env.DB.prepare("SELECT payload FROM sessions WHERE session_id = ?").bind(sessionId).first();
-          if (!row || !row.payload) {
-            return new Response("有効な管理者セッションが存在しません。", { status: 401 });
-          }
-          session = JSON.parse(row.payload);
-        } catch (e) {
-          return new Response("無効なセッションです。", { status: 400 });
+        const session = await getSession(env, sessionId);
+        if (!session) {
+          return new Response("有効な管理者セッションが存在しません。", { status: 401 });
         }
 
-        if (session.userId !== ADMIN_DISCORD_ID) {
+        if (session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
           return new Response("アクセス権限がありません。管理者IDのみ実行可能です。", { status: 403 });
         }
 
@@ -293,7 +310,8 @@ export default {
 
         if (results && results.length > 0) {
           for (const user of results) {
-            const ok = await updateRoleConnection(user.access_token, {}, env);
+            const accessToken = await decryptSecret(user.access_token, env.SESSION_ENCRYPTION_KEY);
+            const ok = accessToken ? await updateRoleConnection(accessToken, {}, env) : false;
             if (ok) {
               successCount++;
             } else {
@@ -309,16 +327,143 @@ export default {
         });
       }
 
-      return Response.redirect(`${url.origin}/privacy`, 302);
+      return Response.redirect(`${new URL(env.DISCORD_REDIRECT_URI).origin}/privacy`, 302);
     } catch (fatalError) {
-      return new Response(`システムエラーが発生しました: ${fatalError.message || "Unknown error"}`, { status: 500 });
+      console.error("Unhandled request error");
+      return new Response("システムエラーが発生しました。", { status: 500 });
     }
   }
 };
 
 /* --- ユーザー自身のデータ削除処理 --- */
 
+async function getSession(env, sessionId) {
+  if (!sessionId || !/^[0-9a-f-]{36}$/.test(sessionId)) return null;
+
+  try {
+    const row = await env.DB.prepare(
+      "SELECT payload, created_at FROM sessions WHERE session_id = ?"
+    ).bind(sessionId).first();
+    if (!row || !row.payload || Number(row.created_at) + SESSION_TTL_SECONDS < Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+
+    const storedSession = JSON.parse(row.payload);
+    const accessToken = await decryptSecret(storedSession.accessToken, env.SESSION_ENCRYPTION_KEY);
+    const refreshToken = await decryptSecret(storedSession.refreshToken, env.SESSION_ENCRYPTION_KEY);
+    if (!storedSession.userId || !accessToken || !refreshToken || !storedSession.csrfToken) return null;
+    return { ...storedSession, accessToken, refreshToken };
+  } catch (e) {
+    console.error("Session lookup failed");
+    return null;
+  }
+}
+
+function getClientIp(request) {
+  return request.headers.get("cf-connecting-ip") || "unknown";
+}
+
+async function enforceRateLimit(binding, key) {
+  if (!binding || typeof binding.limit !== "function") {
+    console.error("RATE_LIMITER binding is not configured");
+    return false;
+  }
+
+  try {
+    const result = await binding.limit({ key });
+    return result?.success === true;
+  } catch (e) {
+    console.error("Rate limit check failed");
+    return false;
+  }
+}
+
+function decodeBase64(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, character => character.charCodeAt(0));
+}
+
+function encodeBase64(bytes) {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function importEncryptionKey(encodedKey) {
+  if (!encodedKey || typeof encodedKey !== "string") {
+    throw new Error("SESSION_ENCRYPTION_KEY is not configured");
+  }
+
+  const keyBytes = decodeBase64(encodedKey.trim());
+  if (keyBytes.byteLength !== 32) {
+    throw new Error("SESSION_ENCRYPTION_KEY must decode to 32 bytes");
+  }
+
+  return crypto.subtle.importKey(
+    "raw",
+    keyBytes,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptSecret(value, encodedKey) {
+  const key = await importEncryptionKey(encodedKey);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plaintext = new TextEncoder().encode(value);
+  const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plaintext);
+  return `enc:v1:${encodeBase64(iv)}.${encodeBase64(new Uint8Array(ciphertext))}`;
+}
+
+async function decryptSecret(value, encodedKey) {
+  if (typeof value !== "string" || !encodedKey) return null;
+
+  // 旧データは次回の検証成功時に暗号化して置き換えるため、一時的に読めるようにする。
+  if (!value.startsWith("enc:v1:")) return value;
+
+  try {
+    const encoded = value.slice("enc:v1:".length).split(".");
+    if (encoded.length !== 2) return null;
+    const iv = decodeBase64(encoded[0]);
+    const ciphertext = decodeBase64(encoded[1]);
+    if (iv.byteLength !== 12 || ciphertext.byteLength < 16) return null;
+    const key = await importEncryptionKey(encodedKey);
+    const plaintext = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
+    return new TextDecoder().decode(plaintext);
+  } catch (e) {
+    return null;
+  }
+}
+
+function isValidGuildId(guildId) {
+  return guildId === "global" || (
+    typeof guildId === "string" &&
+    guildId.length <= MAX_GUILD_ID_LENGTH &&
+    /^\d{17,20}$/.test(guildId)
+  );
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 async function handleDeleteMyData(request, cookies, env) {
+  if (request.method !== "GET" && request.method !== "POST") {
+    return new Response("Method Not Allowed", { status: 405, headers: { Allow: "GET, POST" } });
+  }
+
+  if (!await enforceRateLimit(env.DELETE_RATE_LIMITER, getClientIp(request))) {
+    return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+  }
+
   const sessionId = cookies["v_sess"];
   if (!sessionId) {
     return new Response(`
@@ -331,15 +476,26 @@ async function handleDeleteMyData(request, cookies, env) {
     `, { headers: { "Content-Type": "text/html; charset=utf-8" }, status: 401 });
   }
 
-  let session;
-  try {
-    const row = await env.DB.prepare("SELECT payload FROM sessions WHERE session_id = ?").bind(sessionId).first();
-    if (!row || !row.payload) {
-      return new Response("無効または期限切れのセッションです。", { status: 401 });
-    }
-    session = JSON.parse(row.payload);
-  } catch (e) {
-    return new Response("無効なセッションです。", { status: 400 });
+  const session = await getSession(env, sessionId);
+  if (!session) {
+    return new Response("無効または期限切れのセッションです。", { status: 401 });
+  }
+
+  if (request.method === "GET") {
+    return new Response(`
+      <!DOCTYPE html><html lang="ja"><meta charset="UTF-8"><title>データ削除確認</title>
+      <body><h1>データ削除確認</h1>
+      <p>保存された認証データとDiscord連携情報を削除します。この操作は取り消せません。</p>
+      <form method="POST" action="/delete-my-data">
+        <input type="hidden" name="csrf_token" value="${escapeHtml(session.csrfToken)}">
+        <button type="submit">データを削除する</button>
+      </form></body></html>
+    `, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+
+  const formData = await request.formData();
+  if (formData.get("csrf_token") !== session.csrfToken) {
+    return new Response("CSRFトークンの検証に失敗しました。", { status: 403 });
   }
 
   await updateRoleConnection(session.accessToken, {}, env);
@@ -368,7 +524,12 @@ async function handleDeleteMyData(request, cookies, env) {
 
 /* --- メタデータ定義更新 --- */
 
-async function handleUpdateMetadata(env) {
+async function handleUpdateMetadata(request, cookies, env) {
+  const session = await getSession(env, cookies["v_sess"]);
+  if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+    return new Response("管理者権限または有効なCSRFトークンが必要です。", { status: 403 });
+  }
+
   try {
     const url = `https://discord.com/api/v10/applications/${env.DISCORD_CLIENT_ID}/role-connections/metadata`;
     
@@ -403,19 +564,19 @@ async function handleUpdateMetadata(env) {
     });
 
     if (!res.ok) {
-      const errText = await res.text();
-      return new Response(`メタデータ定義更新失敗: ${errText}`, { status: res.status });
+      await res.text();
+      return new Response("メタデータ定義の更新に失敗しました。", { status: 502 });
     }
 
     return new Response("Discord Linked Role メタデータ定義を更新しました！", { status: 200 });
   } catch (e) {
-    return new Response(`API通信エラー: ${e.message}`, { status: 500 });
+    return new Response("API通信エラーが発生しました。", { status: 500 });
   }
 }
 
 /* --- UI描画 --- */
 
-function renderAuthPage(userId, siteKey, isAdmin = false) {
+function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
   const adminPanel = isAdmin ? `
     <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #4e5058;">
       <p style="color: #ed4245; font-weight: bold; font-size: 13px;">管理者用メニュー (${ADMIN_DISCORD_ID})</p>
@@ -424,7 +585,10 @@ function renderAuthPage(userId, siteKey, isAdmin = false) {
     <script>
       async function unlinkAllUsers() {
         if (!confirm('本当にデータベース内の全ユーザーの連携（ロールメタデータ）を解除しますか？')) return;
-        const res = await fetch('/admin/unlink-all', { method: 'POST' });
+        const res = await fetch('/admin/unlink-all', {
+          method: 'POST',
+          headers: { 'X-CSRF-Token': '${escapeHtml(csrfToken)}' }
+        });
         const text = await res.text();
         alert(text);
       }
@@ -457,7 +621,8 @@ function renderAuthPage(userId, siteKey, isAdmin = false) {
         <p style="font-size: 14px; color: #dbdee1;">利用規約を確認し、Captcha を完了して送信してください。</p>
         
         <form action="/verify" method="POST" id="verifyForm">
-          <div class="h-captcha" data-sitekey="${siteKey}"></div>
+          <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+          <div class="h-captcha" data-sitekey="${escapeHtml(siteKey)}"></div>
 
           <label class="checkbox-container">
             <input type="checkbox" id="termsCheck" name="terms_agreed" value="true" required onchange="document.getElementById('submitBtn').disabled = !this.checked;">
@@ -579,8 +744,12 @@ function parseCookies(cookieHeader) {
     const parts = cookie.split("=");
     const name = parts.shift()?.trim();
     const value = parts.join("=")?.trim();
-    if (name) {
-      list[name] = decodeURIComponent(value);
+    if (name && value !== undefined) {
+      try {
+        list[name] = decodeURIComponent(value);
+      } catch (e) {
+        list[name] = "";
+      }
     }
   });
 
