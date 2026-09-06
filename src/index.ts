@@ -1,3 +1,5 @@
+const ADMIN_DISCORD_ID = "1506950854249418765";
+
 export default {
   async fetch(request, env) {
     try {
@@ -9,12 +11,12 @@ export default {
         return renderPrivacyPolicy();
       }
 
-      // 0-2. 利用規約 (新規追加)
+      // 0-2. 利用規約
       if (url.pathname === "/terms") {
         return renderTermsOfService();
       }
 
-      // 1. Linked Role メタデータ定義更新 API
+      // 1. Linked Role メタデータ定義更新 API (Bot管理者用)
       if (url.pathname === "/update-metadata") {
         return await handleUpdateMetadata(env);
       }
@@ -31,13 +33,18 @@ export default {
           env.DISCORD_REDIRECT_URI
         )}&response_type=code&scope=identify%20role_connections.write&state=${encodeURIComponent(statePayload)}`;
 
-        const response = Response.redirect(authUrl, 302);
-        // CSRF検証用Stateを短期Cookieに保持
-        response.headers.append(
+        // Response.redirectではなくnew Response()を使用してImmutable Headerエラーを回避
+        const headers = new Headers();
+        headers.set("Location", authUrl);
+        headers.append(
           "Set-Cookie",
           `oauth_state=${stateToken}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600`
         );
-        return response;
+
+        return new Response(null, {
+          status: 302,
+          headers: headers
+        });
       }
 
       // 3. OAuth2 コールバック受取 & 認証・同意画面表示
@@ -69,21 +76,19 @@ export default {
           return new Response("Discordユーザー情報の取得に失敗しました。", { status: 500 });
         }
 
-        // セッション識別子を発行してアクセストークンを一時保持 (隠しパラメータでの露呈を防ぐ)
-        const sessionKey = crypto.randomUUID();
+        // セッション識別子を発行してアクセストークンを一時保持
         const sessionPayload = JSON.stringify({
           userId: user.id,
           accessToken: tokenData.access_token,
           guildId: guildId || "global"
         });
 
-        // Workerの簡易キャッシュ等または暗号化トークンCookieとして渡す
-        const response = renderAuthPage(user.id, sessionKey, env.HCAPTCHA_SITEKEY);
+        const response = renderAuthPage(user.id, env.HCAPTCHA_SITEKEY, user.id === ADMIN_DISCORD_ID);
         response.headers.append(
           "Set-Cookie",
-          `v_sess=${encodeURIComponent(sessionPayload)}; Path=/verify; HttpOnly; Secure; SameSite=Strict; Max-Age=600`
+          `v_sess=${encodeURIComponent(sessionPayload)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=600`
         );
-        // 使った oauth_state は削除
+        // 使用済み oauth_state の削除
         response.headers.append("Set-Cookie", "oauth_state=; Path=/; HttpOnly; Secure; Max-Age=0");
 
         return response;
@@ -145,7 +150,6 @@ export default {
 
         let subAccountNumber = 1;
         try {
-          // 同一デバイスIDまたは同一IPかつ別Discord IDの既存認証数をカウント
           const existingRecords = await env.DB.prepare(
             "SELECT discord_id, device_id FROM users WHERE guild_id = ? AND verified_at IS NOT NULL"
           ).bind(guildId).all();
@@ -196,9 +200,52 @@ export default {
           "Set-Cookie",
           `device_id=${deviceId}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000`
         );
-        res.headers.append("Set-Cookie", "v_sess=; Path=/verify; HttpOnly; Secure; Max-Age=0");
+        res.headers.append("Set-Cookie", "v_sess=; Path=/; HttpOnly; Secure; Max-Age=0");
 
         return res;
+      }
+
+      // 5. 管理者用 全員アンリンク API (管理者ID権限チェック付き)
+      if (url.pathname === "/admin/unlink-all" && request.method === "POST") {
+        const sessCookie = cookies["v_sess"];
+        if (!sessCookie) {
+          return new Response("管理者セッションが見つかりません。先に /login から管理者アカウントでログインしてください。", { status: 401 });
+        }
+
+        let session;
+        try {
+          session = JSON.parse(decodeURIComponent(sessCookie));
+        } catch (e) {
+          return new Response("無効なセッションです。", { status: 400 });
+        }
+
+        if (session.userId !== ADMIN_DISCORD_ID) {
+          return new Response("アクセス権限がありません。管理者IDのみ実行可能です。", { status: 403 });
+        }
+
+        // DBから全ユーザーのアクセストークンを取得
+        const { results } = await env.DB.prepare("SELECT discord_id, access_token FROM users").all();
+        let successCount = 0;
+        let failCount = 0;
+
+        if (results && results.length > 0) {
+          for (const user of results) {
+            // メタデータを空にしてアンリンク状態にする
+            const ok = await updateRoleConnection(user.access_token, {}, env);
+            if (ok) {
+              successCount++;
+            } else {
+              failCount++;
+            }
+          }
+        }
+
+        // DBの全認証情報をクリア
+        await env.DB.prepare("DELETE FROM users").run();
+
+        return new Response(`[管理者処理完了]\nアンリンク成功: ${successCount}件\n失敗(トークン切れ等): ${failCount}件\nDBの検証データを削除しました。`, {
+          headers: { "Content-Type": "text/plain; charset=utf-8" }
+        });
       }
 
       return Response.redirect(`${url.origin}/privacy`, 302);
@@ -257,7 +304,22 @@ async function handleUpdateMetadata(env) {
 
 /* --- UI描画 --- */
 
-function renderAuthPage(userId, sessionKey, siteKey) {
+function renderAuthPage(userId, siteKey, isAdmin = false) {
+  const adminPanel = isAdmin ? `
+    <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #4e5058;">
+      <p style="color: #ed4245; font-weight: bold; font-size: 13px;">管理者用メニュー (${ADMIN_DISCORD_ID})</p>
+      <button type="button" onclick="unlinkAllUsers()" style="background: #da373c; margin-top: 5px;">⚠️ 全全員の連携解除 (全員アンリンク)</button>
+    </div>
+    <script>
+      async function unlinkAllUsers() {
+        if (!confirm('本当にデータベース内の全ユーザーの連携（ロールメタデータ）を解除しますか？')) return;
+        const res = await fetch('/admin/unlink-all', { method: 'POST' });
+        const text = await res.text();
+        alert(text);
+      }
+    </script>
+  ` : '';
+
   const html = `
     <!DOCTYPE html>
     <html lang="ja">
@@ -269,7 +331,6 @@ function renderAuthPage(userId, sessionKey, siteKey) {
       <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #313338; color: white; margin: 0; padding: 20px 0; box-sizing: border-box; }
         .card { background: #2b2d31; padding: 30px; border-radius: 8px; text-align: center; box-shadow: 0 4px 10px rgba(0,0,0,0.3); max-width: 420px; width: 90%; }
-        .terms-box { text-align: left; background: #1e1f22; padding: 12px; border-radius: 4px; font-size: 13px; margin: 15px 0; color: #dbdee1; }
         .checkbox-container { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 15px 0; font-size: 13px; cursor: pointer; }
         .checkbox-container input { cursor: pointer; width: 16px; height: 16px; }
         button { margin-top: 10px; padding: 12px 20px; background: #5865F2; border: none; color: white; border-radius: 4px; font-weight: bold; cursor: pointer; width: 100%; font-size: 15px; }
@@ -294,6 +355,9 @@ function renderAuthPage(userId, sessionKey, siteKey) {
 
           <button type="submit" id="submitBtn" disabled>同意して送信</button>
         </form>
+
+        ${adminPanel}
+
         <div class="footer">
           <a href="/terms" target="_blank">利用規約</a> | <a href="/privacy" target="_blank">プライバシーポリシー</a>
         </div>
@@ -340,7 +404,6 @@ function renderPrivacyPolicy() {
 
         <h3>3. 情報の管理・第三者提供</h3>
         <p>取得した情報は認証・ロール付与に必要な目的以外には使用せず、法令に基づく場合を除き第三者へ開示・提供することはありません。</p>
-        <p>削除要請について:https://discord.gg/XdGrtFSbQ6からお申し出ください</p>
       </div>
     </body>
     </html>
