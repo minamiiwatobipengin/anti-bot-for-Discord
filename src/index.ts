@@ -148,31 +148,44 @@ export default {
           deviceId = crypto.randomUUID();
         }
 
-        // D. IP または Cookie (device_id) のいずれか一致によるメイン/サブ判定
+        // D. メイン/サブアカウント判定ロジック
         let subAccountNumber = 1;
         try {
-          // Cookie(device_id) または IP(last_ip) のどちらかが一致するアカウント一覧を取得（最古の認証順）
-          const existingAccounts = await env.DB.prepare(
-            `SELECT DISTINCT discord_id, MIN(verified_at) as first_verified 
-             FROM users 
-             WHERE (device_id = ? OR last_ip = ?) AND verified_at IS NOT NULL 
-             GROUP BY discord_id 
-             ORDER BY first_verified ASC`
-          ).bind(deviceId, clientIp).all();
+          let existingAccounts;
+
+          // プロキシ/VPN使用時 (vpnClean === 0) は IP 一致判定を除外し Cookie (device_id) のみで判定
+          if (vpnClean === 0) {
+            existingAccounts = await env.DB.prepare(
+              `SELECT discord_id, MIN(created_at) as first_seen 
+               FROM users 
+               WHERE device_id = ? 
+               GROUP BY discord_id 
+               ORDER BY first_seen ASC`
+            ).bind(deviceId).all();
+          } else {
+            // プロキシ未検出時 (vpnClean === 1) は Cookie(device_id) または IP(last_ip) のいずれか一致で判定
+            existingAccounts = await env.DB.prepare(
+              `SELECT discord_id, MIN(created_at) as first_seen 
+               FROM users 
+               WHERE device_id = ? OR last_ip = ? 
+               GROUP BY discord_id 
+               ORDER BY first_seen ASC`
+            ).bind(deviceId, clientIp).all();
+          }
 
           if (existingAccounts && existingAccounts.results && existingAccounts.results.length > 0) {
             const list = existingAccounts.results;
             const index = list.findIndex(acc => acc.discord_id === discordId);
 
             if (index !== -1) {
-              // 過去に認証履歴があるアカウント：最古の認証日時順のインデックス + 1
+              // 過去に記録があるアカウント：最古の初回記録日時順のインデックス + 1
               subAccountNumber = index + 1;
             } else {
-              // 同一IPまたは同一Cookieの別アカウントがすでに存在する場合：次の番号（2, 3...）を割り当て
+              // 同一Cookie（または同一クリーンIP）の別アカウントがすでに存在する場合：次の順位を付与
               subAccountNumber = list.length + 1;
             }
           } else {
-            // IPもCookieも完全に新規の場合は 1 (メイン)
+            // 完全に新規の場合は 1 (メイン)
             subAccountNumber = 1;
           }
         } catch (e) {
@@ -185,15 +198,24 @@ export default {
         const expiresAt = nowSeconds + 3600;
 
         try {
+          // 現在のユーザーの最古の created_at を取得（初回認証時刻を維持するため）
+          const existingUserRecord = await env.DB.prepare(
+            `SELECT MIN(created_at) as min_created FROM users WHERE discord_id = ?`
+          ).bind(discordId).first();
+
+          const createdAt = existingUserRecord && existingUserRecord.min_created 
+            ? existingUserRecord.min_created 
+            : nowSeconds;
+
           await env.DB.prepare(
-            `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, last_ip, device_id)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, created_at, last_ip, device_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
                access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?`
           ).bind(
-            // INSERT用
-            discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId,
-            // UPDATE用
+            // INSERT用 (9パラメータ)
+            discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, createdAt, clientIp, deviceId,
+            // UPDATE用 (6パラメータ)
             accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId
           ).run();
         } catch (e) {
@@ -203,9 +225,9 @@ export default {
 
         // F. Discord へメタデータ送信
         const updated = await updateRoleConnection(accessToken, {
-          human_verified: humanVerified,
-          vpn_clean: vpnClean,
-          sub_account_number: subAccountNumber
+          human_verified: Boolean(humanVerified),
+          vpn_clean: Boolean(vpnClean),
+          sub_account_number: Number(subAccountNumber)
         }, env);
 
         if (!updated) {
@@ -213,7 +235,7 @@ export default {
         }
 
         const res = new Response(`<html>
-            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
+            <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #1e1f22; color: #dbdee1;">
               <h1>このタブを安全に閉じることができます</h1><script>window.close()</script>
             </body>
           </html>`, {
@@ -330,20 +352,20 @@ async function handleUpdateMetadata(env) {
     const body = [
       {
         key: "human_verified",
-        name: "人間認証 (hCaptcha)",
-        description: "Captchaを要求する",
+        name: "人間認証 (hCaptcha) パス",
+        description: "Captchaをクリアしているか",
         type: 7
       },
       {
         key: "vpn_clean",
-        name: "VPN / Proxy / Tor 禁止",
-        description: "VPN・Tor・プロキシ・筑波大学公開VPN等を禁止する",
+        name: "VPN / Proxy / Tor 未使用",
+        description: "VPN・Tor・プロキシ・筑波大学VPN等を使用していないか",
         type: 7
       },
       {
         key: "sub_account_number",
-        name: "サブ垢制限",
-        description: "許可するアカウント数",
+        name: "アカウント順位 (サブ垢制限)",
+        description: "メイン=1, サブ1=2, サブ2=3... (例: 1以下に設定でメインのみ許可)",
         type: 6
       }
     ];
@@ -692,8 +714,16 @@ async function updateRoleConnection(accessToken, metadata, env) {
       body: JSON.stringify(body)
     });
 
-    return res.ok;
+    // Discord API は成功時に 200 (OK) または 204 (No Content) を返します
+    if (res.status === 200 || res.status === 204) {
+      return true;
+    }
+
+    const errText = await res.text();
+    console.error(`[Linked Role Error] Status: ${res.status}, Body: ${errText}`);
+    return false;
   } catch (e) {
+    console.error("[Linked Role Exception]", e);
     return false;
   }
 }
