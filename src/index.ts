@@ -161,15 +161,18 @@ export default {
 
         const expiresAt = Math.floor(Date.now() / 1000) + 3600;
         try {
+          // session から refreshToken を取得（または tokenData から引き継ぐ）
+          const refreshToken = session.refreshToken || 'N/A';
+
           await env.DB.prepare(
             `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, last_ip, device_id)
-             VALUES (?, ?, ?, 'N/A', ?, ?, ?, ?)
-             ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
-               access_token=?, expires_at=?, verified_at=?, last_ip=?, device_id=?`
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+   ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
+     access_token=?, refresh_token=?, expires_at=?, verified_at=?, last_ip=?, device_id=?`
           ).bind(
-            discordId, guildId, accessToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId,
-            accessToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId
-          ).run();
+            discordId, guildId, accessToken, refreshToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId,
+            accessToken, refreshToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId
+          ).run();B
         } catch (e) {
           return new Response("データベースへの保存に失敗しました。", { status: 500 });
         }
