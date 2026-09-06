@@ -32,11 +32,11 @@ export default {
         const stateToken = crypto.randomUUID();
         const statePayload = `${guildId}:${stateToken}`;
 
-        const authUrl = `https://discord.com/oauth2/authorize?client_id=${
-          env.DISCORD_CLIENT_ID
-        }&redirect_uri=${encodeURIComponent(
-          env.DISCORD_REDIRECT_URI
-        )}&response_type=code&scope=identify%20role_connections.write&state=${encodeURIComponent(statePayload)}`;
+        // 修正後
+        const authUrl = `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_CLIENT_ID
+          }&redirect_uri=${encodeURIComponent(
+            env.DISCORD_REDIRECT_URI
+          )}&response_type=code&scope=identify%20role_connections.write%20offline.access&state=${encodeURIComponent(statePayload)}`;
 
         const headers = new Headers();
         headers.set("Location", authUrl);
@@ -301,7 +301,7 @@ async function handleDeleteMyData(request, cookies, env) {
 async function handleUpdateMetadata(env) {
   try {
     const url = `https://discord.com/api/v10/applications/${env.DISCORD_CLIENT_ID}/role-connections/metadata`;
-    
+
     const body = [
       {
         key: "human_verified",
@@ -576,7 +576,7 @@ async function verifyHCaptcha(token, secret) {
 function checkIpThreatLevel(request) {
   const cf = request.cf;
   if (!cf || typeof cf !== "object") {
-    return true; 
+    return true;
   }
 
   const country = cf.country || "";
