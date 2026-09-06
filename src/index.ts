@@ -2,6 +2,7 @@ const ADMIN_DISCORD_ID = "1506950854249418765";
 const SESSION_TTL_SECONDS = 600;
 const OAUTH_STATE_TTL_SECONDS = 600;
 const MAX_OAUTH_STATES = 5;
+const MAX_STORED_OAUTH_STATES = 10000;
 const MAX_GUILD_ID_LENGTH = 20;
 const MAX_FORM_BODY_BYTES = 64 * 1024;
 const MAX_ADMIN_UNLINK_USERS = 100;
@@ -141,7 +142,7 @@ export default {
         }
 
         // DBからセッションデータを取得
-        const session = await getSession(env, sessionId);
+        let session = await getSession(env, sessionId);
         if (!session) {
           return new Response("セッションが見つからないか期限切れです。", { status: 401 });
         }
@@ -171,10 +172,9 @@ export default {
         }
         humanVerified = 1;
 
-        const consumeResult = await env.DB.prepare(
-          "DELETE FROM sessions WHERE session_id = ?"
-        ).bind(sessionId).run();
-        if (!consumeResult?.meta || consumeResult.meta.changes !== 1) {
+        // 外部 API と DB を変更する前にセッションを原子的に消費し、並行実行を防ぐ。
+        session = await consumeSession(env, sessionId);
+        if (!session) {
           return new Response("セッションがすでに使用済みか無効です。", { status: 401 });
         }
 
@@ -385,10 +385,44 @@ async function getSession(env, sessionId) {
   }
 }
 
+async function consumeSession(env, sessionId) {
+  if (!sessionId || !/^[0-9a-f-]{36}$/.test(sessionId)) return null;
+
+  try {
+    const result = await env.DB.prepare(
+      "DELETE FROM sessions WHERE session_id = ? AND created_at >= ? RETURNING payload, created_at"
+    ).bind(
+      sessionId,
+      Math.floor(Date.now() / 1000) - SESSION_TTL_SECONDS
+    ).first();
+    if (!result?.payload) return null;
+
+    const storedSession = JSON.parse(result.payload);
+    const accessToken = await decryptSecret(storedSession.accessToken, env.SESSION_ENCRYPTION_KEY);
+    const refreshToken = await decryptSecret(storedSession.refreshToken, env.SESSION_ENCRYPTION_KEY);
+    if (!storedSession.userId || !accessToken || !refreshToken || !storedSession.csrfToken) return null;
+    return { ...storedSession, accessToken, refreshToken };
+  } catch (e) {
+    console.error("Session consume failed");
+    return null;
+  }
+}
+
 async function purgeExpiredUsers(env) {
-  await env.DB.prepare(
-    "DELETE FROM users WHERE expires_at <= ?"
-  ).bind(Math.floor(Date.now() / 1000)).run();
+  const { results } = await env.DB.prepare(
+    "SELECT discord_id, guild_id, access_token FROM users WHERE expires_at <= ?"
+  ).bind(Math.floor(Date.now() / 1000)).all();
+
+  for (const user of results || []) {
+    const accessToken = await decryptSecret(user.access_token, env.SESSION_ENCRYPTION_KEY);
+    if (!accessToken || !await updateRoleConnection(accessToken, {}, env)) {
+      continue;
+    }
+
+    await env.DB.prepare(
+      "DELETE FROM users WHERE discord_id = ? AND guild_id = ? AND expires_at <= ?"
+    ).bind(user.discord_id, user.guild_id, Math.floor(Date.now() / 1000)).run();
+  }
 }
 
 async function readFormDataWithLimit(request, maxBytes) {
@@ -430,6 +464,16 @@ async function saveOAuthState(env, stateToken, guildId) {
   await env.DB.prepare(
     "DELETE FROM sessions WHERE session_id LIKE 'oauth:%' AND created_at < ?"
   ).bind(cutoff).run();
+  await env.DB.prepare(
+    `DELETE FROM sessions
+     WHERE session_id LIKE 'oauth:%'
+       AND session_id NOT IN (
+         SELECT session_id FROM sessions
+         WHERE session_id LIKE 'oauth:%'
+         ORDER BY created_at DESC
+         LIMIT ?
+       )`
+  ).bind(MAX_STORED_OAUTH_STATES).run();
   await env.DB.prepare(
     "INSERT INTO sessions (session_id, payload, created_at) VALUES (?, ?, ?)"
   ).bind(
@@ -691,7 +735,7 @@ async function handleDeleteMyData(request, cookies, env) {
     `, { headers: { "Content-Type": "text/html; charset=utf-8" }, status: 401 });
   }
 
-  const session = await getSession(env, sessionId);
+  let session = await getSession(env, sessionId);
   if (!session) {
     return new Response("無効または期限切れのセッションです。", { status: 401 });
   }
@@ -716,6 +760,11 @@ async function handleDeleteMyData(request, cookies, env) {
     return new Response("CSRFトークンの検証に失敗しました。", { status: 403 });
   }
 
+  session = await consumeSession(env, sessionId);
+  if (!session) {
+    return new Response("セッションがすでに使用済みか無効です。", { status: 401 });
+  }
+
   const roleConnectionCleared = await updateRoleConnection(session.accessToken, {}, env);
   const accessTokenRevoked = await revokeDiscordToken(session.accessToken, env);
   const refreshTokenRevoked = session.refreshToken !== "N/A"
@@ -724,7 +773,6 @@ async function handleDeleteMyData(request, cookies, env) {
 
   try {
     await env.DB.prepare("DELETE FROM users WHERE discord_id = ?").bind(session.userId).run();
-    await env.DB.prepare("DELETE FROM sessions WHERE session_id = ?").bind(sessionId).run();
   } catch (e) {
     return new Response("データベース上のデータ削除に失敗しました。", { status: 500 });
   }
