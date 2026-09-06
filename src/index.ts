@@ -166,13 +166,13 @@ export default {
 
           await env.DB.prepare(
             `INSERT INTO users (discord_id, guild_id, access_token, refresh_token, expires_at, verified_at, last_ip, device_id)
-   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-   ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
-     access_token=?, refresh_token=?, expires_at=?, verified_at=?, last_ip=?, device_id=?`
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
+              access_token=?, refresh_token=?, expires_at=?, verified_at=?, last_ip=?, device_id=?`
           ).bind(
             discordId, guildId, accessToken, refreshToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId,
             accessToken, refreshToken, expiresAt, Math.floor(Date.now() / 1000), clientIp, deviceId
-          ).run();B
+          ).run();
         } catch (e) {
           return new Response("データベースへの保存に失敗しました。", { status: 500 });
         }
