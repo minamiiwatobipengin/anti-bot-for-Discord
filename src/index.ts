@@ -26,7 +26,7 @@ export default {
         return await handleUpdateMetadata(env);
       }
 
-      // 2. OAuth2 認証開始 (CSRF防止用 state の生成と Cookie 設定)
+      // 2. OAuth2 認証開始
       if (url.pathname === "/login") {
         const guildId = url.searchParams.get("guild_id") || "global";
         const stateToken = crypto.randomUUID();
@@ -51,7 +51,7 @@ export default {
         });
       }
 
-      // 3. OAuth2 コールバック受取 & 認証・同意画面表示
+      // 3. OAuth2 コールバック受取 & 認証画面表示
       if (url.pathname === "/callback") {
         const code = url.searchParams.get("code");
         const state = url.searchParams.get("state");
@@ -77,7 +77,6 @@ export default {
           return new Response("Discordユーザー情報の取得に失敗しました。", { status: 500 });
         }
 
-        // セッション識別子を発行してアクセストークンとリフレッシュトークンを保持
         const sessionPayload = JSON.stringify({
           userId: user.id,
           accessToken: tokenData.access_token,
@@ -149,31 +148,31 @@ export default {
           deviceId = crypto.randomUUID();
         }
 
-        // D. グローバルでのメイン/サブアカウント判定
+        // D. IP または Cookie (device_id) のいずれか一致によるメイン/サブ判定
         let subAccountNumber = 1;
         try {
-          // 同じ device_id で過去に認証済みのユーザー一覧（古い順＝最初に認証された順）を取得
+          // Cookie(device_id) または IP(last_ip) のどちらかが一致するアカウント一覧を取得（最古の認証順）
           const existingAccounts = await env.DB.prepare(
             `SELECT DISTINCT discord_id, MIN(verified_at) as first_verified 
              FROM users 
-             WHERE device_id = ? AND verified_at IS NOT NULL 
+             WHERE (device_id = ? OR last_ip = ?) AND verified_at IS NOT NULL 
              GROUP BY discord_id 
              ORDER BY first_verified ASC`
-          ).bind(deviceId).all();
+          ).bind(deviceId, clientIp).all();
 
           if (existingAccounts && existingAccounts.results && existingAccounts.results.length > 0) {
             const list = existingAccounts.results;
             const index = list.findIndex(acc => acc.discord_id === discordId);
 
             if (index !== -1) {
-              // 既に一度認証したことがあるアカウントの場合：初認証の古い順のインデックス + 1
+              // 過去に認証履歴があるアカウント：最古の認証日時順のインデックス + 1
               subAccountNumber = index + 1;
             } else {
-              // 初めてこのデバイスで認証する新規アカウントの場合：登録済みアカウント数 + 1
+              // 同一IPまたは同一Cookieの別アカウントがすでに存在する場合：次の番号（2, 3...）を割り当て
               subAccountNumber = list.length + 1;
             }
           } else {
-            // このデバイスで完全初認証の場合は 1（メイン）
+            // IPもCookieも完全に新規の場合は 1 (メイン)
             subAccountNumber = 1;
           }
         } catch (e) {
@@ -192,9 +191,9 @@ export default {
              ON CONFLICT(discord_id, guild_id) DO UPDATE SET 
                access_token = ?, refresh_token = ?, expires_at = ?, verified_at = ?, last_ip = ?, device_id = ?`
           ).bind(
-            // INSERT用 (8パラメータ)
+            // INSERT用
             discordId, guildId, accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId,
-            // UPDATE用 (6パラメータ)
+            // UPDATE用
             accessToken, refreshToken, expiresAt, nowSeconds, clientIp, deviceId
           ).run();
         } catch (e) {
@@ -375,7 +374,7 @@ function renderAuthPage(userId, siteKey, isAdmin = false) {
   const adminPanel = isAdmin ? `
     <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #4e5058;">
       <p style="color: #ed4245; font-weight: bold; font-size: 13px;">管理者用メニュー (${ADMIN_DISCORD_ID})</p>
-      <button type="button" onclick="unlinkAllUsers()" style="background: #da373c; margin-top: 5px;">⚠️ 全全員の連携解除 (全員アンリンク)</button>
+      <button type="button" onclick="unlinkAllUsers()" style="background: #da373c; margin-top: 5px;">⚠️ 全員の連携解除 (全員アンリンク)</button>
     </div>
     <script>
       async function unlinkAllUsers() {
@@ -468,7 +467,7 @@ function renderPrivacyPolicy(origin) {
           <li>Bot・自動化プログラムによるスパム防止</li>
           <li>VPN/プロキシ等を経由した不正アクセスの判定</li>
           <li>Linked Role（連携ロール）メタデータのDiscordへの送信</li>
-          <li>同一端末からの複数サブアカウント制限の判定</li>
+          <li>同一端末および同一IPからの複数サブアカウント制限の判定</li>
         </ul>
 
         <h3>3. 情報の管理・第三者提供</h3>
