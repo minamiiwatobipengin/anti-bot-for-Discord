@@ -191,7 +191,7 @@ export default {
           return new Response("Discord Linked Role メタデータの更新に失敗しました。", { status: 500 });
         }
 
-        const res = new Response("認証処理が完了しました！Discord画面に戻り、ロールの取得状況を確認してください。", {
+        const res = new Response("<h1>このタブを安全に閉じることができます</h1><script>window.close()</script>", {
           headers: { "Content-Type": "text/html; charset=utf-8" }
         });
 
