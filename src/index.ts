@@ -36,7 +36,7 @@ export default {
         const authUrl = `https://discord.com/oauth2/authorize?client_id=${env.DISCORD_CLIENT_ID
           }&redirect_uri=${encodeURIComponent(
             env.DISCORD_REDIRECT_URI
-          )}&response_type=code&scope=identify%20role_connections.write%20offline.access&state=${encodeURIComponent(statePayload)}`;
+          )}&response_type=code&scope=role_connections.write%20identify&state=${encodeURIComponent(statePayload)}`;
 
         const headers = new Headers();
         headers.set("Location", authUrl);
