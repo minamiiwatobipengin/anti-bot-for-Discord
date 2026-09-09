@@ -308,6 +308,101 @@ export default {
       }
 
       // 5. 管理者用 認証済みユーザー一覧 API
+      if (url.pathname === "/admin/dashboard" && request.method === "GET") {
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID) {
+          return new Response("管理者権限が必要です。", { status: 403 });
+        }
+        return renderAdminDashboard(session.csrfToken);
+      }
+
+      if (url.pathname === "/admin/dashboard/data" && request.method === "GET") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `dashboard:${getClientIp(request)}`)) {
+          return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+        }
+
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+
+        await purgeExpiredUsers(env);
+        const { results } = await env.DB.prepare(
+          `SELECT discord_id, guild_id, access_token, verified_at, created_at,
+                  last_ip, device_id, sub_account_number, expires_at
+           FROM users ORDER BY verified_at DESC`
+        ).all();
+        const users = await Promise.all((results || []).map(async (row) => {
+          const accessToken = await decryptSecret(row.access_token, env.SESSION_ENCRYPTION_KEY);
+          const profile = accessToken ? await getDiscordUser(accessToken) : null;
+          return {
+            discord_id: row.discord_id,
+            guild_id: row.guild_id,
+            verified_at: row.verified_at,
+            created_at: row.created_at,
+            last_ip: row.last_ip,
+            device_id: row.device_id,
+            sub_account_number: row.sub_account_number,
+            expires_at: row.expires_at,
+            display_name: profile?.global_name || profile?.username || "取得失敗",
+            username: profile?.username || "",
+            avatar_url: profile?.avatar
+              ? `https://cdn.discordapp.com/avatars/${row.discord_id}/${profile.avatar}.png?size=64`
+              : "https://cdn.discordapp.com/embed/avatars/0.png",
+            profile_available: Boolean(profile)
+          };
+        }));
+
+        return withSecurityHeaders(new Response(JSON.stringify({ users }), {
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        }), true);
+      }
+
+      if (url.pathname === "/admin/revoke" && request.method === "POST") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `revoke:${getClientIp(request)}`)) {
+          return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
+        }
+
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+
+        let body;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "リクエスト形式が不正です。" }), { status: 400 });
+        }
+        if (!/^\d{17,20}$/.test(body?.discord_id) || !isValidGuildId(body?.guild_id)) {
+          return new Response(JSON.stringify({ error: "対象ユーザーが不正です。" }), { status: 400 });
+        }
+
+        const row = await env.DB.prepare(
+          "SELECT access_token, refresh_token FROM users WHERE discord_id = ? AND guild_id = ?"
+        ).bind(body.discord_id, body.guild_id).first();
+        if (!row) {
+          return new Response(JSON.stringify({ error: "対象ユーザーが見つかりません。" }), { status: 404 });
+        }
+
+        const accessToken = await decryptSecret(row.access_token, env.SESSION_ENCRYPTION_KEY);
+        const refreshToken = await decryptSecret(row.refresh_token, env.SESSION_ENCRYPTION_KEY);
+        const roleConnectionCleared = accessToken ? await updateRoleConnection(accessToken, {}, env) : false;
+        const accessTokenRevoked = accessToken ? await revokeDiscordToken(accessToken, env) : false;
+        const refreshTokenRevoked = refreshToken && refreshToken !== "N/A"
+          ? await revokeDiscordToken(refreshToken, env)
+          : true;
+        await env.DB.prepare("DELETE FROM users WHERE discord_id = ? AND guild_id = ?")
+          .bind(body.discord_id, body.guild_id).run();
+
+        return withSecurityHeaders(new Response(JSON.stringify({
+          ok: true,
+          role_connection_cleared: roleConnectionCleared,
+          access_token_revoked: accessTokenRevoked,
+          refresh_token_revoked: refreshTokenRevoked
+        }), { headers: { "Content-Type": "application/json; charset=utf-8" } }), true);
+      }
+
       if (url.pathname === "/admin/users" && request.method === "GET") {
         if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `users:${getClientIp(request)}`)) {
           return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
@@ -911,10 +1006,108 @@ async function handleUpdateMetadata(request, cookies, env) {
 
 /* --- UI描画 --- */
 
+function renderAdminDashboard(csrfToken) {
+  const html = `
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>管理者ダッシュボード | Discord 認証</title>
+      <style>
+        :root { color-scheme: dark; --bg: #0d1117; --panel: #161b22; --panel-2: #1f2630; --line: #303845; --text: #f0f3f6; --muted: #8b98a8; --blue: #58a6ff; --red: #ff6b72; --green: #3fb950; }
+        * { box-sizing: border-box; }
+        body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 10% 0%, #1b2940 0, transparent 32%), var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        .shell { max-width: 1440px; margin: 0 auto; padding: 36px clamp(18px, 4vw, 56px); }
+        .topbar { display: flex; justify-content: space-between; align-items: end; gap: 20px; margin-bottom: 28px; }
+        .eyebrow { color: var(--blue); font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+        h1 { margin: 8px 0 0; font-size: clamp(28px, 4vw, 46px); letter-spacing: -0.03em; }
+        .subtle { color: var(--muted); margin: 8px 0 0; }
+        .actions { display: flex; gap: 10px; flex-wrap: wrap; justify-content: end; }
+        button, input { font: inherit; }
+        button { border: 1px solid var(--line); border-radius: 8px; padding: 11px 15px; color: var(--text); background: var(--panel-2); cursor: pointer; font-weight: 700; }
+        button:hover { border-color: var(--blue); transform: translateY(-1px); }
+        button:disabled { opacity: .6; cursor: wait; transform: none; }
+        .danger { background: #3b2028; border-color: #71333c; color: #ffb4b8; }
+        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 20px; }
+        .stat, .content { background: rgba(22, 27, 34, .9); border: 1px solid var(--line); border-radius: 12px; }
+        .stat { padding: 18px 20px; }
+        .stat-label { color: var(--muted); font-size: 13px; }
+        .stat-value { display: block; font-size: 30px; font-weight: 800; margin-top: 5px; }
+        .content { overflow: hidden; }
+        .toolbar { display: flex; gap: 12px; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
+        .search { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
+        .search:focus { border-color: var(--blue); }
+        .status { color: var(--muted); font-size: 13px; }
+        .table-wrap { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; min-width: 980px; }
+        th, td { padding: 14px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+        th { color: var(--muted); font-size: 12px; font-weight: 700; white-space: nowrap; }
+        td { font-size: 13px; }
+        tr:last-child td { border-bottom: 0; }
+        .person { display: flex; align-items: center; gap: 11px; min-width: 190px; }
+        .avatar { width: 38px; height: 38px; border-radius: 50%; object-fit: cover; background: var(--panel-2); }
+        .name { font-weight: 700; }
+        .id, .mono { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 11px; }
+        .pill { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #193524; color: #7ee787; font-size: 11px; font-weight: 700; }
+        .pill.expired { background: #3b2028; color: #ffb4b8; }
+        .row-action { padding: 7px 10px; color: #ffb4b8; background: transparent; border-color: #71333c; font-size: 12px; }
+        .empty { color: var(--muted); text-align: center; padding: 42px 16px; }
+        @media (max-width: 700px) { .topbar { display: block; } .actions { justify-content: start; margin-top: 18px; } .stats { grid-template-columns: 1fr; } .toolbar { display: block; } .search { margin-bottom: 10px; } }
+      </style>
+    </head>
+    <body>
+      <main class="shell">
+        <header class="topbar">
+          <div><div class="eyebrow">Private operations</div><h1>認証ユーザー</h1><p class="subtle">プロフィール、接続情報、認証状態を管理します。</p></div>
+          <div class="actions"><button type="button" id="refresh">↻ 更新</button><button type="button" class="danger" id="revokeAll">一括失効（最大100件）</button></div>
+        </header>
+        <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">表示中</span><strong class="stat-value" id="visible">-</strong></div></section>
+        <section class="content"><div class="toolbar"><input class="search" id="search" type="search" placeholder="表示名、ユーザーID、IP、Cookie ID を検索"><span class="status" id="status">読み込み中...</span></div><div class="table-wrap"><table><thead><tr><th>ユーザー</th><th>IP アドレス</th><th>Cookie ID</th><th>認証情報</th><th>有効期限</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>該当するユーザーはいません。</div></div></section>
+      </main>
+      <script>
+        const csrfToken = '${escapeHtml(csrfToken)}';
+        let users = [];
+        const $ = (id) => document.getElementById(id);
+        const date = (value) => value ? new Date(value * 1000).toLocaleString('ja-JP') : '-';
+        function render() {
+          const query = $('search').value.trim().toLowerCase();
+          const filtered = users.filter(user => [user.display_name, user.username, user.discord_id, user.last_ip, user.device_id].some(value => String(value || '').toLowerCase().includes(query)));
+          $('rows').replaceChildren();
+          $('empty').hidden = filtered.length !== 0;
+          $('visible').textContent = filtered.length;
+          filtered.forEach(user => {
+            const row = document.createElement('tr');
+            const person = document.createElement('td');
+            person.innerHTML = '<div class="person"><img class="avatar" alt=""><div><div class="name"></div><div class="id"></div></div></div>';
+            person.querySelector('img').src = user.avatar_url;
+            person.querySelector('.name').textContent = user.display_name;
+            person.querySelector('.id').textContent = user.discord_id;
+            const ip = document.createElement('td'); ip.className = 'mono'; ip.textContent = user.last_ip || '-';
+            const cookie = document.createElement('td'); cookie.className = 'mono'; cookie.textContent = user.device_id || '-';
+            const verified = document.createElement('td'); verified.innerHTML = '<span class="pill">認証済み</span><div class="id"></div>'; verified.querySelector('.id').textContent = date(user.verified_at);
+            const expiry = document.createElement('td'); expiry.textContent = date(user.expires_at);
+            const action = document.createElement('td'); const revoke = document.createElement('button'); revoke.className = 'row-action'; revoke.textContent = '失効'; revoke.onclick = () => revokeUser(user, revoke); action.append(revoke);
+            row.append(person, ip, cookie, verified, expiry, action); $('rows').append(row);
+          });
+        }
+        async function load() {
+          $('status').textContent = '読み込み中...'; $('refresh').disabled = true;
+          try { const response = await fetch('/admin/dashboard/data', { headers: { 'X-CSRF-Token': csrfToken } }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '取得に失敗しました'); users = data.users || []; $('total').textContent = users.length; $('active').textContent = users.filter(user => user.expires_at * 1000 > Date.now()).length; render(); $('status').textContent = '最終更新: ' + new Date().toLocaleTimeString('ja-JP'); } catch (error) { $('status').textContent = error.message; } finally { $('refresh').disabled = false; }
+        }
+        async function revokeUser(user, button) { if (!confirm(user.display_name + ' の認証を失効させますか？')) return; button.disabled = true; try { const response = await fetch('/admin/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ discord_id: user.discord_id, guild_id: user.guild_id }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '失効に失敗しました'); users = users.filter(item => !(item.discord_id === user.discord_id && item.guild_id === user.guild_id)); $('total').textContent = users.length; $('active').textContent = users.filter(item => item.expires_at * 1000 > Date.now()).length; render(); } catch (error) { alert(error.message); button.disabled = false; } }
+        $('search').addEventListener('input', render); $('refresh').addEventListener('click', load); $('revokeAll').addEventListener('click', async () => { if (!confirm('有効な認証を最大100件まで失効させ、保存データを削除します。続行しますか？')) return; $('revokeAll').disabled = true; try { const response = await fetch('/admin/unlink-all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }); const message = await response.text(); if (!response.ok) throw new Error(message); alert(message); await load(); } catch (error) { alert(error.message); } finally { $('revokeAll').disabled = false; } }); load();
+      </script>
+    </body>
+    </html>`;
+  return withSecurityHeaders(new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } }), true);
+}
+
 function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
   const adminPanel = isAdmin ? `
     <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #4e5058;">
       <p style="color: #ed4245; font-weight: bold; font-size: 13px;">管理者用メニュー (${ADMIN_DISCORD_ID})</p>
+      <a href="/admin/dashboard" target="_blank" style="display:block; margin-top:5px; padding:12px 20px; background:#238636; color:white; border-radius:4px; font-weight:bold; text-decoration:none;">管理者ダッシュボードを開く</a>
       <button type="button" onclick="unlinkAllUsers()" style="background: #da373c; margin-top: 5px;">⚠️ 全員の連携解除 (全員アンリンク)</button>
       <button type="button" onclick="showUsers()" style="background: #4e5058; margin-top: 5px;">認証済みユーザーを表示</button>
       <pre id="adminUsers" style="display:none; text-align:left; white-space:pre-wrap; max-height:300px; overflow:auto; font-size:12px;"></pre>
