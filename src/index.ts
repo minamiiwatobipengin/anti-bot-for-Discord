@@ -211,6 +211,7 @@ export default {
         const lockToken = crypto.randomUUID();
 
         if (!await acquireVerificationLock(env, lockToken, nowSeconds)) {
+          await restoreSession(env, sessionId, session);
           return new Response("認証処理が集中しています。しばらく待ってから再試行してください。", { status: 503 });
         }
 
@@ -266,9 +267,11 @@ export default {
             ).run();
           } catch (e) {
             console.error("Database verification error");
+            await restoreSession(env, sessionId, session);
             return new Response("データベース処理でエラーが発生しました。", { status: 500 });
           }
         } catch (e) {
+          await restoreSession(env, sessionId, session);
           return new Response("認証処理でエラーが発生しました。", { status: 500 });
         } finally {
           await releaseVerificationLock(env, lockToken);
@@ -282,12 +285,14 @@ export default {
         }, env);
 
         if (!updated) {
+          await restoreSession(env, sessionId, session);
           return new Response("Discord Linked Role メタデータの更新に失敗しました。", { status: 500 });
         }
 
         const res = new Response(`<html>
             <body style="font-family: sans-serif; text-align: center; padding-top: 50px; background: #1e1f22; color: #dbdee1;">
-              <h1>このタブを安全に閉じることができます</h1><script>window.close()</script>
+              <h1>認証が完了しました</h1>
+              <p>Discord への連携情報を更新しました。このタブは安全に閉じることができます。</p>
             </body>
           </html>`, {
           headers: { "Content-Type": "text/html; charset=utf-8" }
@@ -299,10 +304,36 @@ export default {
         );
         res.headers.append("Set-Cookie", "v_sess=; Path=/; HttpOnly; Secure; Max-Age=0");
 
-        return res;
+        return withSecurityHeaders(res, true);
       }
 
-      // 5. 管理者用 全員アンリンク API
+      // 5. 管理者用 認証済みユーザー一覧 API
+      if (url.pathname === "/admin/users" && request.method === "GET") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `users:${getClientIp(request)}`)) {
+          return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
+        }
+
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response("管理者権限または有効なCSRFトークンが必要です。", { status: 403 });
+        }
+
+        await purgeExpiredUsers(env);
+        const { results } = await env.DB.prepare(
+          `SELECT discord_id, guild_id, verified_at, created_at, last_ip, device_id,
+                  sub_account_number, expires_at
+           FROM users
+           ORDER BY verified_at DESC`
+        ).all();
+
+        return withSecurityHeaders(new Response(JSON.stringify({
+          users: results || []
+        }), {
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        }), true);
+      }
+
+      // 6. 管理者用 全員アンリンク API
       if (url.pathname === "/admin/unlink-all" && request.method === "POST") {
         if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `unlink:${getClientIp(request)}`)) {
           return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
@@ -405,6 +436,22 @@ async function consumeSession(env, sessionId) {
   } catch (e) {
     console.error("Session consume failed");
     return null;
+  }
+}
+
+async function restoreSession(env, sessionId, session) {
+  try {
+    const accessToken = await encryptSecret(session.accessToken, env.SESSION_ENCRYPTION_KEY);
+    const refreshToken = await encryptSecret(session.refreshToken || "N/A", env.SESSION_ENCRYPTION_KEY);
+    await env.DB.prepare(
+      "INSERT OR REPLACE INTO sessions (session_id, payload, created_at) VALUES (?, ?, ?)"
+    ).bind(
+      sessionId,
+      JSON.stringify({ ...session, accessToken, refreshToken }),
+      Math.floor(Date.now() / 1000)
+    ).run();
+  } catch (e) {
+    console.error("Session restore failed");
   }
 }
 
@@ -869,8 +916,35 @@ function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
     <div style="margin-top: 25px; padding-top: 15px; border-top: 1px solid #4e5058;">
       <p style="color: #ed4245; font-weight: bold; font-size: 13px;">管理者用メニュー (${ADMIN_DISCORD_ID})</p>
       <button type="button" onclick="unlinkAllUsers()" style="background: #da373c; margin-top: 5px;">⚠️ 全員の連携解除 (全員アンリンク)</button>
+      <button type="button" onclick="showUsers()" style="background: #4e5058; margin-top: 5px;">認証済みユーザーを表示</button>
+      <pre id="adminUsers" style="display:none; text-align:left; white-space:pre-wrap; max-height:300px; overflow:auto; font-size:12px;"></pre>
     </div>
     <script>
+      async function showUsers() {
+        const output = document.getElementById('adminUsers');
+        const res = await fetch('/admin/users', {
+          headers: { 'X-CSRF-Token': '${escapeHtml(csrfToken)}' }
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          output.textContent = data.error || 'ユーザー情報の取得に失敗しました。';
+          output.style.display = 'block';
+          return;
+        }
+        output.textContent = data.users.map((user, index) => [
+          '#' + (index + 1),
+          'Discord ID: ' + user.discord_id,
+          'Guild: ' + user.guild_id,
+          '認証日時: ' + new Date(user.verified_at * 1000).toLocaleString('ja-JP'),
+          '作成日時: ' + new Date(user.created_at * 1000).toLocaleString('ja-JP'),
+          'IP: ' + user.last_ip,
+          '端末ID: ' + user.device_id,
+          'サブアカウント番号: ' + user.sub_account_number,
+          'トークン有効期限: ' + new Date(user.expires_at * 1000).toLocaleString('ja-JP'),
+          '---'
+        ].join('\\n')).join('\\n');
+        output.style.display = 'block';
+      }
       async function unlinkAllUsers() {
         if (!confirm('本当にデータベース内の全ユーザーの連携（ロールメタデータ）を解除しますか？')) return;
         const res = await fetch('/admin/unlink-all', {
