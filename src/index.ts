@@ -6,6 +6,7 @@ const MAX_STORED_OAUTH_STATES = 10000;
 const MAX_GUILD_ID_LENGTH = 20;
 const MAX_FORM_BODY_BYTES = 64 * 1024;
 const MAX_ADMIN_UNLINK_USERS = 100;
+const MAX_ANNOUNCEMENT_LENGTH = 2000;
 const EXTERNAL_REQUEST_TIMEOUT_MS = 10000;
 
 export default {
@@ -481,6 +482,32 @@ export default {
           guild_id: guildId,
           members: memberResult.members
         }), { headers: { "Content-Type": "application/json; charset=utf-8" } }), true);
+      }
+
+      if (url.pathname === "/admin/announce" && request.method === "POST") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `announce:${getClientIp(request)}`)) {
+          return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
+        }
+
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+
+        let body;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "リクエスト形式が不正です。" }), { status: 400 });
+        }
+        if (typeof body?.content !== "string" || !body.content.trim() || body.content.length > MAX_ANNOUNCEMENT_LENGTH) {
+          return new Response(JSON.stringify({ error: `本文は1文字以上${MAX_ANNOUNCEMENT_LENGTH}文字以内で入力してください。` }), { status: 400 });
+        }
+
+        const result = await announceToAllGuilds(body.content.trim(), env);
+        return withSecurityHeaders(new Response(JSON.stringify(result), {
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        }), true);
       }
 
       if (url.pathname === "/admin/revoke" && request.method === "POST") {
@@ -1250,6 +1277,11 @@ function renderAdminDashboard(csrfToken) {
         .member-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; max-height: 560px; overflow-y: auto; }
         .member-card { display: flex; align-items: center; gap: 10px; padding: 11px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; }
         .member-card .avatar { width: 34px; height: 34px; }
+        .announce-panel { margin-bottom: 20px; padding: 20px; background: rgba(22, 27, 34, .9); border: 1px solid var(--line); border-radius: 12px; }
+        .announce-form { display: flex; gap: 12px; align-items: end; }
+        .announce-form textarea { flex: 1; min-height: 96px; resize: vertical; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
+        .announce-form textarea:focus { border-color: var(--blue); }
+        .announce-form button { flex: 0 0 auto; }
         .content { overflow: hidden; }
         .toolbar { display: flex; gap: 12px; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
         .search { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
@@ -1269,7 +1301,7 @@ function renderAdminDashboard(csrfToken) {
         .pill.expired { background: #3b2028; color: #ffb4b8; }
         .row-action { padding: 7px 10px; color: #ffb4b8; background: transparent; border-color: #71333c; font-size: 12px; }
         .empty { color: var(--muted); text-align: center; padding: 42px 16px; }
-        @media (max-width: 700px) { .topbar { display: block; } .actions { justify-content: start; margin-top: 18px; } .stats { grid-template-columns: 1fr; } .toolbar { display: block; } .search { margin-bottom: 10px; } .section-heading { display: block; } }
+        @media (max-width: 700px) { .topbar { display: block; } .actions { justify-content: start; margin-top: 18px; } .stats { grid-template-columns: 1fr; } .toolbar { display: block; } .search { margin-bottom: 10px; } .section-heading { display: block; } .announce-form { display: block; } .announce-form button { width: 100%; margin-top: 10px; } }
       </style>
     </head>
     <body>
@@ -1278,6 +1310,7 @@ function renderAdminDashboard(csrfToken) {
           <div><div class="eyebrow">Private operations</div><h1>認証ユーザー</h1><p class="subtle">プロフィール、接続情報、認証状態を管理します。</p></div>
           <div class="actions"><button type="button" id="refresh">↻ 更新</button><button type="button" class="danger" id="revokeAll">一括失効（最大100件）</button></div>
         </header>
+        <section class="announce-panel"><div class="section-heading"><div><div class="eyebrow">Broadcast</div><h2>全サーバーへお知らせ</h2></div><span class="status">アナウンスチャンネルを優先して配信</span></div><form class="announce-form" id="announceForm"><textarea id="announcement" maxlength="${MAX_ANNOUNCEMENT_LENGTH}" placeholder="全サーバーに配信する本文" required></textarea><button type="submit" id="announceButton">配信する</button></form><p class="status" id="announceStatus"></p></section>
         <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">導入サーバー</span><strong class="stat-value" id="guildTotal">-</strong></div><div class="stat"><span class="stat-label">表示中</span><strong class="stat-value" id="visible">-</strong></div></section>
         <section class="guild-panel"><div class="section-heading"><div><div class="eyebrow">Discord installation</div><h2>導入サーバー</h2></div><span class="status" id="guildStatus">読み込み中...</span></div><div class="guild-grid" id="guilds"></div></section>
         <section class="member-panel" id="memberPanel"><div class="section-heading"><div><div class="eyebrow">Server members</div><h2 id="memberTitle">メンバー</h2></div><span class="status" id="memberStatus"></span></div><div class="member-grid" id="members"></div></section>
@@ -1372,6 +1405,7 @@ function renderAdminDashboard(csrfToken) {
           }
         }
         async function revokeUser(user, button) { if (!confirm(user.display_name + ' の認証を失効させますか？')) return; button.disabled = true; try { const response = await fetch('/admin/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ discord_id: user.discord_id, guild_id: user.guild_id }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '失効に失敗しました'); users = users.filter(item => !(item.discord_id === user.discord_id && item.guild_id === user.guild_id)); $('total').textContent = users.length; $('active').textContent = users.filter(item => item.expires_at * 1000 > Date.now()).length; render(); } catch (error) { alert(error.message); button.disabled = false; } }
+        $('announceForm').addEventListener('submit', async (event) => { event.preventDefault(); const content = $('announcement').value.trim(); if (!content || !confirm('全サーバーへお知らせを配信しますか？')) return; $('announceButton').disabled = true; $('announceStatus').textContent = '配信中...'; try { const response = await fetch('/admin/announce', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '配信に失敗しました'); const failed = data.results.filter(result => !result.ok); $('announceStatus').textContent = '完了: ' + data.sent + '件成功 / ' + data.total + '件中' + failed.length + '件失敗' + (failed.length ? '。詳細はブラウザの開発者コンソールを確認してください。' : ''); if (failed.length) console.warn('配信失敗', failed); } catch (error) { $('announceStatus').textContent = error.message; } finally { $('announceButton').disabled = false; } });
         $('search').addEventListener('input', render); $('refresh').addEventListener('click', () => { load(); loadGuilds(); }); $('revokeAll').addEventListener('click', async () => { if (!confirm('有効な認証を最大100件まで失効させ、保存データを削除します。続行しますか？')) return; $('revokeAll').disabled = true; try { const response = await fetch('/admin/unlink-all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }); const message = await response.text(); if (!response.ok) throw new Error(message); alert(message); await load(); await loadGuilds(); } catch (error) { alert(error.message); } finally { $('revokeAll').disabled = false; } }); load(); loadGuilds();
       </script>
     </body>
@@ -1728,6 +1762,83 @@ async function getBotGuilds(env) {
   } catch (e) {
     console.error("Discord guild lookup failed");
     return [];
+  }
+}
+
+async function announceToAllGuilds(content, env) {
+  const guilds = await getBotGuilds(env);
+  const results = [];
+
+  for (const guild of guilds) {
+    const channels = await getBotGuildChannels(env, guild.id);
+    if (!channels.ok) {
+      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: channels.error });
+      continue;
+    }
+
+    const announcementChannels = channels.channels
+      .filter(channel => channel.type === 5)
+      .sort(compareDiscordChannels);
+    const textChannels = channels.channels
+      .filter(channel => channel.type === 0)
+      .sort(compareDiscordChannels);
+    const channel = announcementChannels[0] || textChannels[0];
+    if (!channel) {
+      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: "配信可能なチャンネルがありません。" });
+      continue;
+    }
+
+    try {
+      const response = await fetchWithTimeout(`https://discord.com/api/v10/channels/${channel.id}/messages`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ content })
+      });
+      if (!response.ok) {
+        results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: response.status === 403 ? "Botにメッセージ送信権限がありません。" : `Discord APIエラー (${response.status})` });
+        continue;
+      }
+      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", channel_id: channel.id, channel_name: channel.name, ok: true });
+    } catch (e) {
+      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: "Discord APIへの接続に失敗しました。" });
+    }
+  }
+
+  return {
+    total: results.length,
+    sent: results.filter(result => result.ok).length,
+    results
+  };
+}
+
+function compareDiscordChannels(left, right) {
+  const positionDifference = Number(left.position || 0) - Number(right.position || 0);
+  return positionDifference || String(left.id).localeCompare(String(right.id));
+}
+
+async function getBotGuildChannels(env, guildId) {
+  if (!env.DISCORD_BOT_TOKEN) {
+    return { ok: false, error: "Botトークンが設定されていません。", channels: [] };
+  }
+
+  try {
+    const response = await fetchWithTimeout(`https://discord.com/api/v10/guilds/${guildId}/channels`, {
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: response.status === 403 ? "Botにチャンネル閲覧権限がありません。" : `Discord APIエラー (${response.status})`,
+        channels: []
+      };
+    }
+    const channels = await response.json();
+    return { ok: Array.isArray(channels), error: Array.isArray(channels) ? null : "Discordのチャンネル情報が不正です。", channels: Array.isArray(channels) ? channels : [] };
+  } catch (e) {
+    return { ok: false, error: "Discord APIへの接続に失敗しました。", channels: [] };
   }
 }
 
