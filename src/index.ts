@@ -426,7 +426,7 @@ export default {
             ? `/admin/avatar?guild_id=${guild.id}&icon=${encodeURIComponent(guild.icon)}`
             : "/admin/avatar?default=1",
           member_count: guild.approximate_member_count || null,
-          verified_count: Number(counts.get(guild.id)?.verified_count || 0),
+          verified_count: Number(counts.get(guild.id)?.verified_count || 0) + Number(counts.get("global")?.verified_count || 0),
           last_verified_at: counts.get(guild.id)?.last_verified_at || null
         }));
         const knownGuildIds = new Set(guilds.map(guild => guild.id));
@@ -437,7 +437,7 @@ export default {
             name: "登録データ上のサーバー（Bot APIで未確認）",
             icon_url: "/admin/avatar?default=1",
             member_count: null,
-            verified_count: Number(row.verified_count || 0),
+            verified_count: Number(row.verified_count || 0) + Number(counts.get("global")?.verified_count || 0),
             last_verified_at: row.last_verified_at
           });
         }
@@ -1119,7 +1119,7 @@ function renderAdminDashboard(csrfToken) {
         button:hover { border-color: var(--blue); transform: translateY(-1px); }
         button:disabled { opacity: .6; cursor: wait; transform: none; }
         .danger { background: #3b2028; border-color: #71333c; color: #ffb4b8; }
-        .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 20px; }
         .stat, .content { background: rgba(22, 27, 34, .9); border: 1px solid var(--line); border-radius: 12px; }
         .stat { padding: 18px 20px; }
         .stat-label { color: var(--muted); font-size: 13px; }
@@ -1160,7 +1160,7 @@ function renderAdminDashboard(csrfToken) {
           <div><div class="eyebrow">Private operations</div><h1>認証ユーザー</h1><p class="subtle">プロフィール、接続情報、認証状態を管理します。</p></div>
           <div class="actions"><button type="button" id="refresh">↻ 更新</button><button type="button" class="danger" id="revokeAll">一括失効（最大100件）</button></div>
         </header>
-        <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">導入サーバー</span><strong class="stat-value" id="guildTotal">-</strong></div></section>
+        <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">導入サーバー</span><strong class="stat-value" id="guildTotal">-</strong></div><div class="stat"><span class="stat-label">表示中</span><strong class="stat-value" id="visible">-</strong></div></section>
         <section class="guild-panel"><div class="section-heading"><div><div class="eyebrow">Discord installation</div><h2>導入サーバー</h2></div><span class="status" id="guildStatus">読み込み中...</span></div><div class="guild-grid" id="guilds"></div></section>
         <section class="content"><div class="toolbar"><input class="search" id="search" type="search" placeholder="表示名、ユーザーID、IP、Cookie ID を検索"><span class="status" id="status">読み込み中...</span></div><div class="table-wrap"><table><thead><tr><th>ユーザー</th><th>IP アドレス</th><th>Cookie ID</th><th>認証情報</th><th>有効期限</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>該当するユーザーはいません。</div></div></section>
       </main>
