@@ -316,6 +316,41 @@ export default {
         return renderAdminDashboard(session.csrfToken);
       }
 
+      if (url.pathname === "/admin/avatar" && request.method === "GET") {
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID) {
+          return new Response("管理者権限が必要です。", { status: 403 });
+        }
+
+        const userId = url.searchParams.get("user_id");
+        const avatarHash = url.searchParams.get("avatar");
+        const isDefaultAvatar = url.searchParams.get("default") === "1";
+        if (isDefaultAvatar && (userId || avatarHash)) {
+          return new Response("画像指定が不正です。", { status: 400 });
+        }
+        if (!isDefaultAvatar && (!/^\d{17,20}$/.test(userId || "") || !/^[a-f\d]{8,128}$/i.test(avatarHash || ""))) {
+          return new Response("画像指定が不正です。", { status: 400 });
+        }
+
+        const avatarResponse = await fetchWithTimeout(
+          isDefaultAvatar
+            ? "https://cdn.discordapp.com/embed/avatars/0.png"
+            : `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=128`
+        );
+        if (!avatarResponse.ok) {
+          return new Response("プロフィール画像を取得できませんでした。", { status: 404 });
+        }
+
+        const response = new Response(avatarResponse.body, {
+          headers: {
+            "Content-Type": avatarResponse.headers.get("Content-Type") || "image/png",
+            "Cache-Control": "private, max-age=300",
+            "X-Content-Type-Options": "nosniff"
+          }
+        });
+        return response;
+      }
+
       if (url.pathname === "/admin/dashboard/data" && request.method === "GET") {
         if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `dashboard:${getClientIp(request)}`)) {
           return new Response("リクエストが多すぎます。しばらく待ってから再試行してください。", { status: 429 });
@@ -347,8 +382,8 @@ export default {
             display_name: profile?.global_name || profile?.username || "取得失敗",
             username: profile?.username || "",
             avatar_url: profile?.avatar
-              ? `https://cdn.discordapp.com/avatars/${row.discord_id}/${profile.avatar}.png?size=64`
-              : "https://cdn.discordapp.com/embed/avatars/0.png",
+              ? `/admin/avatar?user_id=${row.discord_id}&avatar=${encodeURIComponent(profile.avatar)}`
+              : "/admin/avatar?default=1",
             profile_available: Boolean(profile)
           };
         }));
@@ -866,7 +901,7 @@ function withSecurityHeaders(response, noStore = false) {
   response.headers.set("X-Content-Type-Options", "nosniff");
   response.headers.set("X-Frame-Options", "DENY");
   response.headers.set("Referrer-Policy", "no-referrer");
-  response.headers.set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; script-src 'self' https://js.hcaptcha.com 'unsafe-inline'; frame-src https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com");
+  response.headers.set("Content-Security-Policy", "default-src 'self'; img-src 'self'; frame-ancestors 'none'; script-src 'self' https://js.hcaptcha.com 'unsafe-inline'; frame-src https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com");
   if (noStore) response.headers.set("Cache-Control", "no-store");
   return response;
 }
