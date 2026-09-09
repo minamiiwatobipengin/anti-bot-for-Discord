@@ -323,19 +323,27 @@ export default {
         }
 
         const userId = url.searchParams.get("user_id");
+        const guildId = url.searchParams.get("guild_id");
         const avatarHash = url.searchParams.get("avatar");
+        const iconHash = url.searchParams.get("icon");
         const isDefaultAvatar = url.searchParams.get("default") === "1";
-        if (isDefaultAvatar && (userId || avatarHash)) {
+        const isGuildIcon = Boolean(guildId || iconHash);
+        if (isDefaultAvatar && (userId || guildId || avatarHash || iconHash)) {
           return new Response("画像指定が不正です。", { status: 400 });
         }
-        if (!isDefaultAvatar && (!/^\d{17,20}$/.test(userId || "") || !/^[a-f\d]{8,128}$/i.test(avatarHash || ""))) {
+        if (!isDefaultAvatar && isGuildIcon && (!/^\d{17,20}$/.test(guildId || "") || !/^[a-z\d_-]{8,128}$/i.test(iconHash || ""))) {
+          return new Response("画像指定が不正です。", { status: 400 });
+        }
+        if (!isDefaultAvatar && !isGuildIcon && (!/^\d{17,20}$/.test(userId || "") || !/^[a-z\d_-]{8,128}$/i.test(avatarHash || ""))) {
           return new Response("画像指定が不正です。", { status: 400 });
         }
 
         const avatarResponse = await fetchWithTimeout(
           isDefaultAvatar
             ? "https://cdn.discordapp.com/embed/avatars/0.png"
-            : `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=128`
+            : isGuildIcon
+              ? `https://cdn.discordapp.com/icons/${guildId}/${iconHash}.png?size=128`
+              : `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=128`
         );
         if (!avatarResponse.ok) {
           return new Response("プロフィール画像を取得できませんでした。", { status: 404 });
@@ -391,6 +399,53 @@ export default {
         return withSecurityHeaders(new Response(JSON.stringify({ users }), {
           headers: { "Content-Type": "application/json; charset=utf-8" }
         }), true);
+      }
+
+      if (url.pathname === "/admin/dashboard/guilds" && request.method === "GET") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `guilds:${getClientIp(request)}`)) {
+          return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
+        }
+
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+
+        const [{ results }, botGuilds] = await Promise.all([
+          env.DB.prepare(
+            `SELECT guild_id, COUNT(*) AS verified_count, MAX(verified_at) AS last_verified_at
+             FROM users GROUP BY guild_id ORDER BY last_verified_at DESC`
+          ).all(),
+          getBotGuilds(env)
+        ]);
+        const counts = new Map((results || []).map(row => [row.guild_id, row]));
+        const guilds = botGuilds.map(guild => ({
+          id: guild.id,
+          name: guild.name || "名前なしサーバー",
+          icon_url: guild.icon
+            ? `/admin/avatar?guild_id=${guild.id}&icon=${encodeURIComponent(guild.icon)}`
+            : "/admin/avatar?default=1",
+          member_count: guild.approximate_member_count || null,
+          verified_count: Number(counts.get(guild.id)?.verified_count || 0),
+          last_verified_at: counts.get(guild.id)?.last_verified_at || null
+        }));
+        const knownGuildIds = new Set(guilds.map(guild => guild.id));
+        for (const row of results || []) {
+          if (row.guild_id === "global" || knownGuildIds.has(row.guild_id)) continue;
+          guilds.push({
+            id: row.guild_id,
+            name: "登録データ上のサーバー（Bot APIで未確認）",
+            icon_url: "/admin/avatar?default=1",
+            member_count: null,
+            verified_count: Number(row.verified_count || 0),
+            last_verified_at: row.last_verified_at
+          });
+        }
+
+        return withSecurityHeaders(new Response(JSON.stringify({
+          guilds,
+          global_verified_count: Number(counts.get("global")?.verified_count || 0)
+        }), { headers: { "Content-Type": "application/json; charset=utf-8" } }), true);
       }
 
       if (url.pathname === "/admin/revoke" && request.method === "POST") {
@@ -1069,6 +1124,14 @@ function renderAdminDashboard(csrfToken) {
         .stat { padding: 18px 20px; }
         .stat-label { color: var(--muted); font-size: 13px; }
         .stat-value { display: block; font-size: 30px; font-weight: 800; margin-top: 5px; }
+        .guild-panel { margin-bottom: 20px; padding: 20px; background: rgba(22, 27, 34, .9); border: 1px solid var(--line); border-radius: 12px; }
+        .section-heading { display: flex; justify-content: space-between; align-items: end; gap: 12px; margin-bottom: 16px; }
+        h2 { margin: 5px 0 0; font-size: 22px; }
+        .guild-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
+        .guild-card { display: flex; align-items: center; gap: 12px; padding: 13px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; }
+        .guild-icon { width: 42px; height: 42px; border-radius: 12px; object-fit: cover; background: var(--bg); flex: 0 0 auto; }
+        .guild-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
+        .guild-meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
         .content { overflow: hidden; }
         .toolbar { display: flex; gap: 12px; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
         .search { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
@@ -1088,7 +1151,7 @@ function renderAdminDashboard(csrfToken) {
         .pill.expired { background: #3b2028; color: #ffb4b8; }
         .row-action { padding: 7px 10px; color: #ffb4b8; background: transparent; border-color: #71333c; font-size: 12px; }
         .empty { color: var(--muted); text-align: center; padding: 42px 16px; }
-        @media (max-width: 700px) { .topbar { display: block; } .actions { justify-content: start; margin-top: 18px; } .stats { grid-template-columns: 1fr; } .toolbar { display: block; } .search { margin-bottom: 10px; } }
+        @media (max-width: 700px) { .topbar { display: block; } .actions { justify-content: start; margin-top: 18px; } .stats { grid-template-columns: 1fr; } .toolbar { display: block; } .search { margin-bottom: 10px; } .section-heading { display: block; } }
       </style>
     </head>
     <body>
@@ -1097,7 +1160,8 @@ function renderAdminDashboard(csrfToken) {
           <div><div class="eyebrow">Private operations</div><h1>認証ユーザー</h1><p class="subtle">プロフィール、接続情報、認証状態を管理します。</p></div>
           <div class="actions"><button type="button" id="refresh">↻ 更新</button><button type="button" class="danger" id="revokeAll">一括失効（最大100件）</button></div>
         </header>
-        <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">表示中</span><strong class="stat-value" id="visible">-</strong></div></section>
+        <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">導入サーバー</span><strong class="stat-value" id="guildTotal">-</strong></div></section>
+        <section class="guild-panel"><div class="section-heading"><div><div class="eyebrow">Discord installation</div><h2>導入サーバー</h2></div><span class="status" id="guildStatus">読み込み中...</span></div><div class="guild-grid" id="guilds"></div></section>
         <section class="content"><div class="toolbar"><input class="search" id="search" type="search" placeholder="表示名、ユーザーID、IP、Cookie ID を検索"><span class="status" id="status">読み込み中...</span></div><div class="table-wrap"><table><thead><tr><th>ユーザー</th><th>IP アドレス</th><th>Cookie ID</th><th>認証情報</th><th>有効期限</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>該当するユーザーはいません。</div></div></section>
       </main>
       <script>
@@ -1130,8 +1194,30 @@ function renderAdminDashboard(csrfToken) {
           $('status').textContent = '読み込み中...'; $('refresh').disabled = true;
           try { const response = await fetch('/admin/dashboard/data', { headers: { 'X-CSRF-Token': csrfToken } }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '取得に失敗しました'); users = data.users || []; $('total').textContent = users.length; $('active').textContent = users.filter(user => user.expires_at * 1000 > Date.now()).length; render(); $('status').textContent = '最終更新: ' + new Date().toLocaleTimeString('ja-JP'); } catch (error) { $('status').textContent = error.message; } finally { $('refresh').disabled = false; }
         }
+        async function loadGuilds() {
+          try {
+            const response = await fetch('/admin/dashboard/guilds', { headers: { 'X-CSRF-Token': csrfToken } });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'サーバー一覧の取得に失敗しました');
+            $('guildTotal').textContent = data.guilds.length;
+            $('guildStatus').textContent = '全体認証: ' + data.global_verified_count + '件';
+            $('guilds').replaceChildren();
+            data.guilds.forEach(guild => {
+              const card = document.createElement('article');
+              card.className = 'guild-card';
+              card.innerHTML = '<img class="guild-icon" alt=""><div><div class="guild-name"></div><div class="guild-meta"></div></div>';
+              card.querySelector('.guild-icon').src = guild.icon_url;
+              card.querySelector('.guild-name').textContent = guild.name;
+              card.querySelector('.guild-meta').textContent = '認証 ' + guild.verified_count + '件' + (guild.member_count ? ' · メンバー ' + guild.member_count + '人' : '');
+              $('guilds').append(card);
+            });
+          } catch (error) {
+            $('guildTotal').textContent = '-';
+            $('guildStatus').textContent = error.message;
+          }
+        }
         async function revokeUser(user, button) { if (!confirm(user.display_name + ' の認証を失効させますか？')) return; button.disabled = true; try { const response = await fetch('/admin/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ discord_id: user.discord_id, guild_id: user.guild_id }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '失効に失敗しました'); users = users.filter(item => !(item.discord_id === user.discord_id && item.guild_id === user.guild_id)); $('total').textContent = users.length; $('active').textContent = users.filter(item => item.expires_at * 1000 > Date.now()).length; render(); } catch (error) { alert(error.message); button.disabled = false; } }
-        $('search').addEventListener('input', render); $('refresh').addEventListener('click', load); $('revokeAll').addEventListener('click', async () => { if (!confirm('有効な認証を最大100件まで失効させ、保存データを削除します。続行しますか？')) return; $('revokeAll').disabled = true; try { const response = await fetch('/admin/unlink-all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }); const message = await response.text(); if (!response.ok) throw new Error(message); alert(message); await load(); } catch (error) { alert(error.message); } finally { $('revokeAll').disabled = false; } }); load();
+        $('search').addEventListener('input', render); $('refresh').addEventListener('click', () => { load(); loadGuilds(); }); $('revokeAll').addEventListener('click', async () => { if (!confirm('有効な認証を最大100件まで失効させ、保存データを削除します。続行しますか？')) return; $('revokeAll').disabled = true; try { const response = await fetch('/admin/unlink-all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }); const message = await response.text(); if (!response.ok) throw new Error(message); alert(message); await load(); await loadGuilds(); } catch (error) { alert(error.message); } finally { $('revokeAll').disabled = false; } }); load(); loadGuilds();
       </script>
     </body>
     </html>`;
@@ -1433,6 +1519,22 @@ async function getDiscordUser(accessToken) {
     return await res.json();
   } catch (e) {
     return null;
+  }
+}
+
+async function getBotGuilds(env) {
+  if (!env.DISCORD_BOT_TOKEN) return [];
+
+  try {
+    const response = await fetchWithTimeout("https://discord.com/api/v10/users/@me/guilds?with_counts=true", {
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
+    });
+    if (!response.ok) return [];
+    const guilds = await response.json();
+    return Array.isArray(guilds) ? guilds : [];
+  } catch (e) {
+    console.error("Discord guild lookup failed");
+    return [];
   }
 }
 
