@@ -426,7 +426,7 @@ export default {
             ? `/admin/avatar?guild_id=${guild.id}&icon=${encodeURIComponent(guild.icon)}`
             : "/admin/avatar?default=1",
           member_count: guild.approximate_member_count || null,
-          verified_count: Number(counts.get(guild.id)?.verified_count || 0) + Number(counts.get("global")?.verified_count || 0),
+          verified_count: Number(counts.get(guild.id)?.verified_count || 0),
           last_verified_at: counts.get(guild.id)?.last_verified_at || null
         }));
         const knownGuildIds = new Set(guilds.map(guild => guild.id));
@@ -437,7 +437,7 @@ export default {
             name: "登録データ上のサーバー（Bot APIで未確認）",
             icon_url: "/admin/avatar?default=1",
             member_count: null,
-            verified_count: Number(row.verified_count || 0) + Number(counts.get("global")?.verified_count || 0),
+            verified_count: Number(row.verified_count || 0),
             last_verified_at: row.last_verified_at
           });
         }
@@ -445,6 +445,28 @@ export default {
         return withSecurityHeaders(new Response(JSON.stringify({
           guilds,
           global_verified_count: Number(counts.get("global")?.verified_count || 0)
+        }), { headers: { "Content-Type": "application/json; charset=utf-8" } }), true);
+      }
+
+      if (url.pathname === "/admin/dashboard/members" && request.method === "GET") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `members:${getClientIp(request)}`)) {
+          return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
+        }
+
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+
+        const guildId = url.searchParams.get("guild_id");
+        if (!/^\d{17,20}$/.test(guildId || "")) {
+          return new Response(JSON.stringify({ error: "サーバーIDが不正です。" }), { status: 400 });
+        }
+
+        const members = await getBotGuildMembers(env, guildId);
+        return withSecurityHeaders(new Response(JSON.stringify({
+          guild_id: guildId,
+          members
         }), { headers: { "Content-Type": "application/json; charset=utf-8" } }), true);
       }
 
@@ -1129,9 +1151,16 @@ function renderAdminDashboard(csrfToken) {
         h2 { margin: 5px 0 0; font-size: 22px; }
         .guild-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; }
         .guild-card { display: flex; align-items: center; gap: 12px; padding: 13px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; }
+        .guild-card { cursor: pointer; text-align: left; width: 100%; color: var(--text); }
+        .guild-card:hover { border-color: var(--blue); }
         .guild-icon { width: 42px; height: 42px; border-radius: 12px; object-fit: cover; background: var(--bg); flex: 0 0 auto; }
         .guild-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 700; }
         .guild-meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+        .member-panel { display: none; margin-bottom: 20px; padding: 20px; background: rgba(22, 27, 34, .9); border: 1px solid var(--line); border-radius: 12px; }
+        .member-panel.open { display: block; }
+        .member-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; max-height: 560px; overflow-y: auto; }
+        .member-card { display: flex; align-items: center; gap: 10px; padding: 11px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; }
+        .member-card .avatar { width: 34px; height: 34px; }
         .content { overflow: hidden; }
         .toolbar { display: flex; gap: 12px; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
         .search { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
@@ -1162,6 +1191,7 @@ function renderAdminDashboard(csrfToken) {
         </header>
         <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">導入サーバー</span><strong class="stat-value" id="guildTotal">-</strong></div><div class="stat"><span class="stat-label">表示中</span><strong class="stat-value" id="visible">-</strong></div></section>
         <section class="guild-panel"><div class="section-heading"><div><div class="eyebrow">Discord installation</div><h2>導入サーバー</h2></div><span class="status" id="guildStatus">読み込み中...</span></div><div class="guild-grid" id="guilds"></div></section>
+        <section class="member-panel" id="memberPanel"><div class="section-heading"><div><div class="eyebrow">Server members</div><h2 id="memberTitle">メンバー</h2></div><span class="status" id="memberStatus"></span></div><div class="member-grid" id="members"></div></section>
         <section class="content"><div class="toolbar"><input class="search" id="search" type="search" placeholder="表示名、ユーザーID、IP、Cookie ID を検索"><span class="status" id="status">読み込み中...</span></div><div class="table-wrap"><table><thead><tr><th>ユーザー</th><th>IP アドレス</th><th>Cookie ID</th><th>認証情報</th><th>有効期限</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>該当するユーザーはいません。</div></div></section>
       </main>
       <script>
@@ -1206,6 +1236,10 @@ function renderAdminDashboard(csrfToken) {
               const card = document.createElement('article');
               card.className = 'guild-card';
               card.innerHTML = '<img class="guild-icon" alt=""><div><div class="guild-name"></div><div class="guild-meta"></div></div>';
+              card.setAttribute('role', 'button');
+              card.tabIndex = 0;
+              card.onclick = () => loadMembers(guild);
+              card.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') loadMembers(guild); };
               card.querySelector('.guild-icon').src = guild.icon_url;
               card.querySelector('.guild-name').textContent = guild.name;
               card.querySelector('.guild-meta').textContent = '認証 ' + guild.verified_count + '件' + (guild.member_count ? ' · メンバー ' + guild.member_count + '人' : '');
@@ -1214,6 +1248,31 @@ function renderAdminDashboard(csrfToken) {
           } catch (error) {
             $('guildTotal').textContent = '-';
             $('guildStatus').textContent = error.message;
+          }
+        }
+        async function loadMembers(guild) {
+          const panel = $('memberPanel');
+          panel.classList.add('open');
+          $('memberTitle').textContent = guild.name + ' のメンバー';
+          $('memberStatus').textContent = '読み込み中...';
+          $('members').replaceChildren();
+          try {
+            const response = await fetch('/admin/dashboard/members?guild_id=' + encodeURIComponent(guild.id), { headers: { 'X-CSRF-Token': csrfToken } });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'メンバー一覧の取得に失敗しました');
+            $('memberStatus').textContent = data.members.length + '人';
+            data.members.forEach(member => {
+              const card = document.createElement('div');
+              card.className = 'member-card';
+              card.innerHTML = '<img class="avatar" alt=""><div><div class="name"></div><div class="id"></div></div>';
+              card.querySelector('.avatar').src = member.avatar_url;
+              card.querySelector('.name').textContent = member.display_name + (member.bot ? ' [Bot]' : '');
+              card.querySelector('.id').textContent = member.id;
+              $('members').append(card);
+            });
+            $('memberPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+          } catch (error) {
+            $('memberStatus').textContent = error.message;
           }
         }
         async function revokeUser(user, button) { if (!confirm(user.display_name + ' の認証を失効させますか？')) return; button.disabled = true; try { const response = await fetch('/admin/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ discord_id: user.discord_id, guild_id: user.guild_id }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '失効に失敗しました'); users = users.filter(item => !(item.discord_id === user.discord_id && item.guild_id === user.guild_id)); $('total').textContent = users.length; $('active').textContent = users.filter(item => item.expires_at * 1000 > Date.now()).length; render(); } catch (error) { alert(error.message); button.disabled = false; } }
@@ -1534,6 +1593,34 @@ async function getBotGuilds(env) {
     return Array.isArray(guilds) ? guilds : [];
   } catch (e) {
     console.error("Discord guild lookup failed");
+    return [];
+  }
+}
+
+async function getBotGuildMembers(env, guildId) {
+  if (!env.DISCORD_BOT_TOKEN) return [];
+
+  try {
+    const response = await fetchWithTimeout(
+      `https://discord.com/api/v10/guilds/${guildId}/members?limit=1000`,
+      { headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` } }
+    );
+    if (!response.ok) return [];
+    const members = await response.json();
+    if (!Array.isArray(members)) return [];
+
+    return members.map(member => ({
+      id: member.user?.id,
+      username: member.user?.username || "不明なユーザー",
+      display_name: member.nick || member.user?.global_name || member.user?.username || "不明なユーザー",
+      avatar_url: member.user?.avatar
+        ? `/admin/avatar?user_id=${member.user.id}&avatar=${encodeURIComponent(member.user.avatar)}`
+        : "/admin/avatar?default=1",
+      joined_at: member.joined_at || null,
+      bot: Boolean(member.user?.bot)
+    })).filter(member => member.id);
+  } catch (e) {
+    console.error("Discord guild member lookup failed");
     return [];
   }
 }
