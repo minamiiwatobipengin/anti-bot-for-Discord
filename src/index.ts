@@ -24,6 +24,11 @@ export default {
         return renderTermsOfService();
       }
 
+      if (url.pathname === "/stats") {
+        const stats = await getPublicStats(env);
+        return renderPublicStats(stats);
+      }
+
       // 0-3. ユーザー自身のデータ削除リクエスト
       if (url.pathname === "/delete-my-data") {
         return await handleDeleteMyData(request, cookies, env);
@@ -604,6 +609,7 @@ export default {
   },
   async scheduled(controller, env) {
     await purgeExpiredUsers(env);
+    await recordPublicStats(env);
   }
 };
 
@@ -700,6 +706,81 @@ async function purgeExpiredUsers(env) {
        WHERE discord_id = ?`
     ).bind(storedAccessToken, storedNextRefreshToken, expiresAt, discordId).run();
   }
+}
+
+async function getPublicStats(env) {
+  await ensurePublicStatsTable(env);
+  const [guilds, userCount] = await Promise.all([
+    getBotGuilds(env),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM users WHERE expires_at > ?")
+      .bind(Math.floor(Date.now() / 1000)).first()
+  ]);
+  const serverCount = Array.isArray(guilds) ? guilds.length : 0;
+  const memberCount = (guilds || []).reduce(
+    (total, guild) => total + (Number(guild.approximate_member_count) || 0),
+    0
+  );
+
+  const { results: snapshots } = await env.DB.prepare(
+    `SELECT recorded_at, server_count, member_count, verified_user_count
+     FROM public_stats_snapshots
+     ORDER BY recorded_at DESC LIMIT 168`
+  ).all();
+
+  return {
+    current: {
+      server_count: serverCount,
+      member_count: memberCount,
+      verified_user_count: Number(userCount?.count || 0)
+    },
+    snapshots: (snapshots || []).reverse()
+  };
+}
+
+async function recordPublicStats(env) {
+  try {
+    await ensurePublicStatsTable(env);
+
+    const stats = await getPublicStatsWithoutHistory(env);
+    const recordedAt = Math.floor(Date.now() / 3600000) * 3600;
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO public_stats_snapshots
+       (recorded_at, server_count, member_count, verified_user_count)
+       VALUES (?, ?, ?, ?)`
+    ).bind(recordedAt, stats.server_count, stats.member_count, stats.verified_user_count).run();
+    await env.DB.prepare(
+      "DELETE FROM public_stats_snapshots WHERE recorded_at < ?"
+    ).bind(recordedAt - (168 * 3600)).run();
+  } catch (e) {
+    console.error("Public stats snapshot failed");
+  }
+}
+
+async function ensurePublicStatsTable(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS public_stats_snapshots (
+      recorded_at INTEGER PRIMARY KEY,
+      server_count INTEGER NOT NULL,
+      member_count INTEGER NOT NULL,
+      verified_user_count INTEGER NOT NULL
+    )`
+  ).run();
+}
+
+async function getPublicStatsWithoutHistory(env) {
+  const [guilds, userCount] = await Promise.all([
+    getBotGuilds(env),
+    env.DB.prepare("SELECT COUNT(*) AS count FROM users WHERE expires_at > ?")
+      .bind(Math.floor(Date.now() / 1000)).first()
+  ]);
+  return {
+    server_count: Array.isArray(guilds) ? guilds.length : 0,
+    member_count: (guilds || []).reduce(
+      (total, guild) => total + (Number(guild.approximate_member_count) || 0),
+      0
+    ),
+    verified_user_count: Number(userCount?.count || 0)
+  };
 }
 
 async function readFormDataWithLimit(request, maxBytes) {
@@ -1394,6 +1475,35 @@ function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
   return withSecurityHeaders(new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } }), true);
 }
 
+function renderPublicStats(stats) {
+  const html = `
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>公開統計 | Discord 認証</title>
+      <style>
+        :root { color-scheme: dark; --bg: #0c1117; --panel: #161d26; --line: #2b3847; --text: #edf4fb; --muted: #92a1b2; --blue: #61b1ff; --mint: #53d6b1; }
+        * { box-sizing: border-box; } body { margin: 0; min-height: 100vh; background: radial-gradient(circle at 85% 0%, #173451 0, transparent 34%), var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+        main { max-width: 1180px; margin: auto; padding: 48px clamp(18px, 5vw, 64px); } .eyebrow { color: var(--blue); font-size: 12px; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; } h1 { margin: 10px 0 8px; font-size: clamp(32px, 6vw, 62px); letter-spacing: -.04em; } .intro { color: var(--muted); margin: 0 0 32px; }
+        .metrics { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 22px; } .metric, .chart { background: rgba(22, 29, 38, .9); border: 1px solid var(--line); border-radius: 14px; } .metric { padding: 22px; } .metric-label { color: var(--muted); font-size: 13px; } .metric-value { display: block; margin-top: 8px; font-size: clamp(28px, 4vw, 44px); } .chart { padding: 22px; } .chart h2 { margin: 0; font-size: 20px; } .chart-note { color: var(--muted); font-size: 13px; margin: 7px 0 20px; } .chart-area { height: 260px; display: flex; align-items: end; gap: 5px; border-bottom: 1px solid var(--line); padding: 12px 4px 0; overflow: hidden; } .bar-group { height: 100%; min-width: 9px; flex: 1; display: flex; align-items: end; gap: 2px; } .bar { min-height: 3px; border-radius: 3px 3px 0 0; flex: 1; background: var(--blue); } .bar.members { background: var(--mint); } .bar.users { background: #e7bd68; } .legend { display: flex; gap: 16px; color: var(--muted); font-size: 12px; margin-top: 14px; } .legend span::before { content: ''; display: inline-block; width: 8px; height: 8px; border-radius: 2px; background: var(--blue); margin-right: 5px; } .legend .members::before { background: var(--mint); } .legend .users::before { background: #e7bd68; } footer { color: var(--muted); font-size: 12px; margin-top: 20px; }
+        @media (max-width: 700px) { .metrics { grid-template-columns: 1fr; } .chart-area { height: 210px; } }
+      </style>
+    </head>
+    <body><main><div class="eyebrow">Open metrics</div><h1>サービスの推移</h1><p class="intro">Discord 認証サービスの公開集計です。個人を特定できる情報は含みません。</p>
+      <section class="metrics"><div class="metric"><span class="metric-label">導入サーバー数</span><strong class="metric-value">${stats.current.server_count.toLocaleString("ja-JP")}</strong></div><div class="metric"><span class="metric-label">導入サーバー累計参加人数</span><strong class="metric-value">${stats.current.member_count.toLocaleString("ja-JP")}</strong></div><div class="metric"><span class="metric-label">認証済みユーザー数</span><strong class="metric-value">${stats.current.verified_user_count.toLocaleString("ja-JP")}</strong></div></section>
+      <section class="chart"><h2>直近7日間の推移</h2><p class="chart-note">1時間ごとのスナップショット。導入サーバーの参加人数は Discord の概算値です。</p><div class="chart-area" id="chart"></div><div class="legend"><span>サーバー</span><span class="members">参加人数</span><span class="users">認証済み</span></div></section><footer>最終集計: ${new Date().toLocaleString("ja-JP")}</footer></main>
+      <script>
+        const snapshots = ${JSON.stringify(stats.snapshots)};
+        const chart = document.getElementById('chart');
+        const max = Math.max(1, ...snapshots.flatMap(item => [item.server_count, item.member_count, item.verified_user_count]));
+        snapshots.forEach(item => { const group = document.createElement('div'); group.className = 'bar-group'; [['server_count', ''], ['member_count', ' members'], ['verified_user_count', ' users']].forEach(([key, className]) => { const bar = document.createElement('div'); bar.className = 'bar' + className; bar.style.height = (Number(item[key]) / max * 100) + '%'; bar.title = Number(item[key]).toLocaleString('ja-JP'); group.append(bar); }); chart.append(group); });
+      </script>
+    </body></html>`;
+  return withSecurityHeaders(new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } }), true);
+}
+
 function renderPrivacyPolicy(origin) {
   const html = `
     <!DOCTYPE html>
@@ -1413,6 +1523,7 @@ function renderPrivacyPolicy(origin) {
     <body>
       <div class="container">
         <h1>プライバシーポリシー</h1>
+        <p><a href="/stats">公開統計を見る</a></p>
         <p>本認証システム（以下「当サービス」）は、ユーザーの個人情報の取扱いについて以下のとおりポリシーを定め、適切に管理します。</p>
         
         <h3>1. 取得する情報</h3>
