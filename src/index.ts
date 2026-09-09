@@ -463,10 +463,18 @@ export default {
           return new Response(JSON.stringify({ error: "サーバーIDが不正です。" }), { status: 400 });
         }
 
-        const members = await getBotGuildMembers(env, guildId);
+        const botGuilds = await getBotGuilds(env);
+        if (!botGuilds.some(guild => guild.id === guildId)) {
+          return new Response(JSON.stringify({ error: "Botが参加していないサーバーです。" }), { status: 404 });
+        }
+
+        const memberResult = await getBotGuildMembers(env, guildId);
+        if (!memberResult.ok) {
+          return new Response(JSON.stringify({ error: memberResult.error }), { status: memberResult.status });
+        }
         return withSecurityHeaders(new Response(JSON.stringify({
           guild_id: guildId,
-          members
+          members: memberResult.members
         }), { headers: { "Content-Type": "application/json; charset=utf-8" } }), true);
       }
 
@@ -1195,7 +1203,7 @@ function renderAdminDashboard(csrfToken) {
         <section class="content"><div class="toolbar"><input class="search" id="search" type="search" placeholder="表示名、ユーザーID、IP、Cookie ID を検索"><span class="status" id="status">読み込み中...</span></div><div class="table-wrap"><table><thead><tr><th>ユーザー</th><th>IP アドレス</th><th>Cookie ID</th><th>認証情報</th><th>有効期限</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>該当するユーザーはいません。</div></div></section>
       </main>
       <script>
-        const csrfToken = '${escapeHtml(csrfToken)}';
+        const csrfToken = ${JSON.stringify(String(csrfToken))};
         let users = [];
         const $ = (id) => document.getElementById(id);
         const date = (value) => value ? new Date(value * 1000).toLocaleString('ja-JP') : '-';
@@ -1208,13 +1216,18 @@ function renderAdminDashboard(csrfToken) {
           filtered.forEach(user => {
             const row = document.createElement('tr');
             const person = document.createElement('td');
-            person.innerHTML = '<div class="person"><img class="avatar" alt=""><div><div class="name"></div><div class="id"></div></div></div>';
-            person.querySelector('img').src = user.avatar_url;
-            person.querySelector('.name').textContent = user.display_name;
-            person.querySelector('.id').textContent = user.discord_id;
+            const personLayout = document.createElement('div'); personLayout.className = 'person';
+            const avatar = document.createElement('img'); avatar.className = 'avatar'; avatar.alt = ''; avatar.src = user.avatar_url;
+            const personText = document.createElement('div');
+            const name = document.createElement('div'); name.className = 'name'; name.textContent = user.display_name;
+            const id = document.createElement('div'); id.className = 'id'; id.textContent = user.discord_id;
+            personText.append(name, id); personLayout.append(avatar, personText); person.append(personLayout);
             const ip = document.createElement('td'); ip.className = 'mono'; ip.textContent = user.last_ip || '-';
             const cookie = document.createElement('td'); cookie.className = 'mono'; cookie.textContent = user.device_id || '-';
-            const verified = document.createElement('td'); verified.innerHTML = '<span class="pill">認証済み</span><div class="id"></div>'; verified.querySelector('.id').textContent = date(user.verified_at);
+            const verified = document.createElement('td');
+            const verifiedPill = document.createElement('span'); verifiedPill.className = 'pill'; verifiedPill.textContent = '認証済み';
+            const verifiedDate = document.createElement('div'); verifiedDate.className = 'id'; verifiedDate.textContent = date(user.verified_at);
+            verified.append(verifiedPill, verifiedDate);
             const expiry = document.createElement('td'); expiry.textContent = date(user.expires_at);
             const action = document.createElement('td'); const revoke = document.createElement('button'); revoke.className = 'row-action'; revoke.textContent = '失効'; revoke.onclick = () => revokeUser(user, revoke); action.append(revoke);
             row.append(person, ip, cookie, verified, expiry, action); $('rows').append(row);
@@ -1235,14 +1248,15 @@ function renderAdminDashboard(csrfToken) {
             data.guilds.forEach(guild => {
               const card = document.createElement('article');
               card.className = 'guild-card';
-              card.innerHTML = '<img class="guild-icon" alt=""><div><div class="guild-name"></div><div class="guild-meta"></div></div>';
               card.setAttribute('role', 'button');
               card.tabIndex = 0;
               card.onclick = () => loadMembers(guild);
               card.onkeydown = (event) => { if (event.key === 'Enter' || event.key === ' ') loadMembers(guild); };
-              card.querySelector('.guild-icon').src = guild.icon_url;
-              card.querySelector('.guild-name').textContent = guild.name;
-              card.querySelector('.guild-meta').textContent = '認証 ' + guild.verified_count + '件' + (guild.member_count ? ' · メンバー ' + guild.member_count + '人' : '');
+              const guildIcon = document.createElement('img'); guildIcon.className = 'guild-icon'; guildIcon.alt = ''; guildIcon.src = guild.icon_url;
+              const guildText = document.createElement('div');
+              const guildName = document.createElement('div'); guildName.className = 'guild-name'; guildName.textContent = guild.name;
+              const guildMeta = document.createElement('div'); guildMeta.className = 'guild-meta'; guildMeta.textContent = '認証 ' + guild.verified_count + '件' + (guild.member_count ? ' · メンバー ' + guild.member_count + '人' : '');
+              guildText.append(guildName, guildMeta); card.append(guildIcon, guildText);
               $('guilds').append(card);
             });
           } catch (error) {
@@ -1264,10 +1278,11 @@ function renderAdminDashboard(csrfToken) {
             data.members.forEach(member => {
               const card = document.createElement('div');
               card.className = 'member-card';
-              card.innerHTML = '<img class="avatar" alt=""><div><div class="name"></div><div class="id"></div></div>';
-              card.querySelector('.avatar').src = member.avatar_url;
-              card.querySelector('.name').textContent = member.display_name + (member.bot ? ' [Bot]' : '');
-              card.querySelector('.id').textContent = member.id;
+              const memberAvatar = document.createElement('img'); memberAvatar.className = 'avatar'; memberAvatar.alt = ''; memberAvatar.src = member.avatar_url;
+              const memberText = document.createElement('div');
+              const memberName = document.createElement('div'); memberName.className = 'name'; memberName.textContent = member.display_name + (member.bot ? ' [Bot]' : '');
+              const memberId = document.createElement('div'); memberId.className = 'id'; memberId.textContent = member.id;
+              memberText.append(memberName, memberId); card.append(memberAvatar, memberText);
               $('members').append(card);
             });
             $('memberPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -1296,7 +1311,7 @@ function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
       async function showUsers() {
         const output = document.getElementById('adminUsers');
         const res = await fetch('/admin/users', {
-          headers: { 'X-CSRF-Token': '${escapeHtml(csrfToken)}' }
+          headers: { 'X-CSRF-Token': ${JSON.stringify(String(csrfToken))} }
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
@@ -1322,7 +1337,7 @@ function renderAuthPage(userId, siteKey, isAdmin = false, csrfToken) {
         if (!confirm('本当にデータベース内の全ユーザーの連携（ロールメタデータ）を解除しますか？')) return;
         const res = await fetch('/admin/unlink-all', {
           method: 'POST',
-          headers: { 'X-CSRF-Token': '${escapeHtml(csrfToken)}' }
+          headers: { 'X-CSRF-Token': ${JSON.stringify(String(csrfToken))} }
         });
         const text = await res.text();
         alert(text);
@@ -1606,18 +1621,33 @@ async function getBotGuilds(env) {
 }
 
 async function getBotGuildMembers(env, guildId) {
-  if (!env.DISCORD_BOT_TOKEN) return [];
+  if (!env.DISCORD_BOT_TOKEN) {
+    return { ok: false, status: 503, error: "Botトークンが設定されていません。", members: [] };
+  }
 
   try {
     const response = await fetchWithTimeout(
       `https://discord.com/api/v10/guilds/${guildId}/members?limit=1000`,
       { headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` } }
     );
-    if (!response.ok) return [];
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status === 403 ? 403 : response.status === 429 ? 429 : 502,
+        error: response.status === 403
+          ? "Botにメンバー閲覧権限がありません。"
+          : response.status === 429
+            ? "Discord APIのレート制限中です。しばらく待ってください。"
+            : "Discordからメンバー情報を取得できませんでした。",
+        members: []
+      };
+    }
     const members = await response.json();
-    if (!Array.isArray(members)) return [];
+    if (!Array.isArray(members)) {
+      return { ok: false, status: 502, error: "Discordのメンバー情報が不正です。", members: [] };
+    }
 
-    return members.map(member => ({
+    return { ok: true, status: 200, error: null, members: members.map(member => ({
       id: member.user?.id,
       username: member.user?.username || "不明なユーザー",
       display_name: member.nick || member.user?.global_name || member.user?.username || "不明なユーザー",
@@ -1626,10 +1656,10 @@ async function getBotGuildMembers(env, guildId) {
         : "/admin/avatar?default=1",
       joined_at: member.joined_at || null,
       bot: Boolean(member.user?.bot)
-    })).filter(member => member.id);
+    })).filter(member => member.id) };
   } catch (e) {
     console.error("Discord guild member lookup failed");
-    return [];
+    return { ok: false, status: 502, error: "Discord APIへの接続に失敗しました。", members: [] };
   }
 }
 
