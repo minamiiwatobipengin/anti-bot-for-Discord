@@ -7,13 +7,21 @@ const MAX_GUILD_ID_LENGTH = 20;
 const MAX_FORM_BODY_BYTES = 64 * 1024;
 const MAX_ADMIN_UNLINK_USERS = 100;
 const MAX_ANNOUNCEMENT_LENGTH = 2000;
+const WELCOME_MESSAGE = "導入ありがとうございます！お困りの際はこちらにDMをしていただければ対応いたします！";
+const DISCORD_ADMINISTRATOR_PERMISSION = 8n;
+const DISCORD_INTERACTION_COMMAND = "support";
+const DISCORD_INTERACTION_MAX_BODY_BYTES = 64 * 1024;
 const EXTERNAL_REQUEST_TIMEOUT_MS = 10000;
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
       const cookies = parseCookies(request.headers.get("Cookie") || "");
+
+      if (url.pathname === "/discord/interactions" && request.method === "POST") {
+        return await handleDiscordInteraction(request, env, ctx);
+      }
 
       // 0-1. プライバシーポリシー
       if (url.pathname === "/privacy") {
@@ -510,6 +518,47 @@ export default {
         }), true);
       }
 
+      if (url.pathname === "/admin/dm/inbox" && request.method === "GET") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `dm-inbox:${getClientIp(request)}`)) {
+          return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
+        }
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+        const inbox = await pollAdminDirectMessages(env);
+        return withSecurityHeaders(new Response(JSON.stringify(inbox), {
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        }), true);
+      }
+
+      if (url.pathname === "/admin/dm/reply" && request.method === "POST") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `dm-reply:${getClientIp(request)}`)) {
+          return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
+        }
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+        let body;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "リクエスト形式が不正です。" }), { status: 400 });
+        }
+        if (!/^\d{17,20}$/.test(body?.user_id) || typeof body?.content !== "string" || !body.content.trim() || body.content.length > MAX_ANNOUNCEMENT_LENGTH) {
+          return new Response(JSON.stringify({ error: `返信は1文字以上${MAX_ANNOUNCEMENT_LENGTH}文字以内で入力してください。` }), { status: 400 });
+        }
+        const result = await sendDirectMessage(body.user_id, body.content.trim(), env);
+        if (!result.ok) {
+          return new Response(JSON.stringify({ error: result.error }), { status: 502 });
+        }
+        await saveAdminDmMessage(env, result.message_id, body.user_id, body.content.trim(), true);
+        return withSecurityHeaders(new Response(JSON.stringify({ ok: true }), {
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        }), true);
+      }
+
       if (url.pathname === "/admin/revoke" && request.method === "POST") {
         if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `revoke:${getClientIp(request)}`)) {
           return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
@@ -637,10 +686,141 @@ export default {
   async scheduled(controller, env) {
     await purgeExpiredUsers(env);
     await recordPublicStats(env);
+    await notifyNewGuilds(env);
+    await pollAdminDirectMessages(env);
+    await ensureSupportCommand(env);
   }
 };
 
 /* --- ユーザー自身のデータ削除処理 --- */
+
+async function handleDiscordInteraction(request, env, ctx) {
+  const signature = request.headers.get("X-Signature-Ed25519");
+  const timestamp = request.headers.get("X-Signature-Timestamp");
+  if (!signature || !timestamp || !env.DISCORD_PUBLIC_KEY) {
+    return new Response("署名検証の設定がありません。", { status: 401 });
+  }
+
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength && Number(contentLength) > DISCORD_INTERACTION_MAX_BODY_BYTES) {
+    return new Response("リクエストが大きすぎます。", { status: 413 });
+  }
+  const rawBody = await request.text();
+  if (new TextEncoder().encode(rawBody).byteLength > DISCORD_INTERACTION_MAX_BODY_BYTES) {
+    return new Response("リクエストが大きすぎます。", { status: 413 });
+  }
+
+  if (!await verifyDiscordInteractionSignature(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY)) {
+    return new Response("署名検証に失敗しました。", { status: 401 });
+  }
+
+  let interaction;
+  try {
+    interaction = JSON.parse(rawBody);
+  } catch (e) {
+    return new Response("JSONが不正です。", { status: 400 });
+  }
+
+  if (interaction?.type === 1) {
+    return Response.json({ type: 1 });
+  }
+  if (interaction?.type !== 2 || interaction.data?.name !== DISCORD_INTERACTION_COMMAND) {
+    return Response.json({ type: 4, data: { content: "対応していないインタラクションです。", flags: 64 } });
+  }
+
+  const userId = interaction.member?.user?.id || interaction.user?.id;
+  const permissions = interaction.member?.permissions;
+  let isAdministrator = false;
+  try {
+    isAdministrator = (BigInt(String(permissions || "0")) & DISCORD_ADMINISTRATOR_PERMISSION) !== 0n;
+  } catch (e) {
+    isAdministrator = false;
+  }
+  if (!/^\d{17,20}$/.test(userId || "") || !isAdministrator) {
+    return Response.json({ type: 4, data: { content: "サーバー管理者のみ利用できます。", flags: 64 } });
+  }
+
+  const content = interaction.data.options?.find(option => option.name === "content")?.value;
+  if (typeof content !== "string" || !content.trim() || content.length > MAX_ANNOUNCEMENT_LENGTH) {
+    return Response.json({ type: 4, data: { content: `内容は1文字以上${MAX_ANNOUNCEMENT_LENGTH}文字以内で入力してください。`, flags: 64 } });
+  }
+
+  await ensureAdminDmTables(env);
+  const messageId = `interaction:${interaction.id}`;
+  const saved = await saveAdminDmMessage(env, messageId, userId, content.trim(), false);
+  if (saved) {
+    const notification = sendDirectMessage(ADMIN_DISCORD_ID, `【サーバー管理者から問い合わせ】\n送信者: <@${userId}>\nサーバー: ${interaction.guild_id || "不明"}\n\n${content.trim()}`, env);
+    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(notification);
+  }
+
+  return Response.json({ type: 4, data: { content: "お問い合わせを受け付けました。管理者から DM で返信します。", flags: 64 } });
+}
+
+async function verifyDiscordInteractionSignature(body, signature, timestamp, publicKey) {
+  try {
+    if (!/^[0-9a-f]{128}$/i.test(signature) || !/^[0-9a-f]{64}$/i.test(publicKey) || !/^\d{1,20}$/.test(timestamp)) return false;
+    const key = await crypto.subtle.importKey(
+      "raw",
+      decodeHex(publicKey),
+      { name: "Ed25519" },
+      false,
+      ["verify"]
+    );
+    return await crypto.subtle.verify(
+      { name: "Ed25519" },
+      key,
+      decodeHex(signature),
+      new TextEncoder().encode(timestamp + body)
+    );
+  } catch (e) {
+    console.error("Discord interaction signature verification failed");
+    return false;
+  }
+}
+
+function decodeHex(value) {
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < bytes.length; index++) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+async function ensureSupportCommand(env) {
+  if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_CLIENT_ID) return;
+
+  try {
+    const commandsUrl = `https://discord.com/api/v10/applications/${env.DISCORD_CLIENT_ID}/commands`;
+    const headers = {
+      Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+      "Content-Type": "application/json"
+    };
+    const existingResponse = await fetchWithTimeout(commandsUrl, { headers });
+    const existingPayload = existingResponse.ok ? await existingResponse.json() : [];
+    const existingCommands = Array.isArray(existingPayload) ? existingPayload : [];
+    const commands = existingCommands.filter(command => command.name !== DISCORD_INTERACTION_COMMAND);
+    commands.push({
+      name: DISCORD_INTERACTION_COMMAND,
+      description: "認証サービスの管理者へ問い合わせます",
+      default_member_permissions: String(DISCORD_ADMINISTRATOR_PERMISSION),
+      dm_permission: false,
+      options: [{
+        type: 3,
+        name: "content",
+        description: "問い合わせ内容",
+        required: true,
+        max_length: MAX_ANNOUNCEMENT_LENGTH
+      }]
+    });
+    await fetchWithTimeout(commandsUrl, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify(commands)
+    });
+  } catch (e) {
+    console.error("Support command registration failed");
+  }
+}
 
 async function getSession(env, sessionId) {
   if (!sessionId || !/^[0-9a-f-]{36}$/.test(sessionId)) return null;
@@ -1282,6 +1462,16 @@ function renderAdminDashboard(csrfToken) {
         .announce-form textarea { flex: 1; min-height: 96px; resize: vertical; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
         .announce-form textarea:focus { border-color: var(--blue); }
         .announce-form button { flex: 0 0 auto; }
+        .dm-panel { margin-bottom: 20px; padding: 20px; background: rgba(22, 27, 34, .9); border: 1px solid var(--line); border-radius: 12px; }
+        .dm-grid { display: grid; grid-template-columns: minmax(220px, .7fr) minmax(320px, 1.3fr); gap: 14px; }
+        .dm-users, .dm-thread { min-height: 180px; max-height: 420px; overflow-y: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+        .dm-user { display: block; width: 100%; padding: 12px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; text-align: left; }
+        .dm-user.selected { border-left: 3px solid var(--blue); background: var(--panel-2); }
+        .dm-message { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+        .dm-message.admin { background: rgba(35, 134, 54, .16); }
+        .dm-message-meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
+        .dm-reply { display: flex; gap: 10px; margin-top: 12px; }
+        .dm-reply textarea { flex: 1; min-height: 58px; resize: vertical; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; color: var(--text); }
         .content { overflow: hidden; }
         .toolbar { display: flex; gap: 12px; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
         .search { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
@@ -1310,7 +1500,8 @@ function renderAdminDashboard(csrfToken) {
           <div><div class="eyebrow">Private operations</div><h1>認証ユーザー</h1><p class="subtle">プロフィール、接続情報、認証状態を管理します。</p></div>
           <div class="actions"><button type="button" id="refresh">↻ 更新</button><button type="button" class="danger" id="revokeAll">一括失効（最大100件）</button></div>
         </header>
-        <section class="announce-panel"><div class="section-heading"><div><div class="eyebrow">Broadcast</div><h2>全サーバーへお知らせ</h2></div><span class="status">アナウンスチャンネルを優先して配信</span></div><form class="announce-form" id="announceForm"><textarea id="announcement" maxlength="${MAX_ANNOUNCEMENT_LENGTH}" placeholder="全サーバーに配信する本文" required></textarea><button type="submit" id="announceButton">配信する</button></form><p class="status" id="announceStatus"></p></section>
+        <section class="announce-panel"><div class="section-heading"><div><div class="eyebrow">Direct message</div><h2>全サーバー管理者へお知らせ</h2></div><span class="status">所有者・管理者権限のメンバーへ DM 配信</span></div><form class="announce-form" id="announceForm"><textarea id="announcement" maxlength="${MAX_ANNOUNCEMENT_LENGTH}" placeholder="全サーバー管理者に DM する本文" required></textarea><button type="submit" id="announceButton">DMを送信</button></form><p class="status" id="announceStatus"></p></section>
+        <section class="dm-panel"><div class="section-heading"><div><div class="eyebrow">Support inbox</div><h2>管理者 DM</h2></div><span class="status" id="dmStatus">受信確認中...</span></div><div class="dm-grid"><div class="dm-users" id="dmUsers"></div><div><div class="dm-thread" id="dmThread"><div class="empty">DMを選択してください。</div></div><form class="dm-reply" id="dmReply"><textarea id="dmReplyContent" maxlength="${MAX_ANNOUNCEMENT_LENGTH}" placeholder="返信内容" required></textarea><button type="submit" id="dmReplyButton">返信</button></form></div></div></section>
         <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">導入サーバー</span><strong class="stat-value" id="guildTotal">-</strong></div><div class="stat"><span class="stat-label">表示中</span><strong class="stat-value" id="visible">-</strong></div></section>
         <section class="guild-panel"><div class="section-heading"><div><div class="eyebrow">Discord installation</div><h2>導入サーバー</h2></div><span class="status" id="guildStatus">読み込み中...</span></div><div class="guild-grid" id="guilds"></div></section>
         <section class="member-panel" id="memberPanel"><div class="section-heading"><div><div class="eyebrow">Server members</div><h2 id="memberTitle">メンバー</h2></div><span class="status" id="memberStatus"></span></div><div class="member-grid" id="members"></div></section>
@@ -1405,8 +1596,14 @@ function renderAdminDashboard(csrfToken) {
           }
         }
         async function revokeUser(user, button) { if (!confirm(user.display_name + ' の認証を失効させますか？')) return; button.disabled = true; try { const response = await fetch('/admin/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ discord_id: user.discord_id, guild_id: user.guild_id }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '失効に失敗しました'); users = users.filter(item => !(item.discord_id === user.discord_id && item.guild_id === user.guild_id)); $('total').textContent = users.length; $('active').textContent = users.filter(item => item.expires_at * 1000 > Date.now()).length; render(); } catch (error) { alert(error.message); button.disabled = false; } }
-        $('announceForm').addEventListener('submit', async (event) => { event.preventDefault(); const content = $('announcement').value.trim(); if (!content || !confirm('全サーバーへお知らせを配信しますか？')) return; $('announceButton').disabled = true; $('announceStatus').textContent = '配信中...'; try { const response = await fetch('/admin/announce', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '配信に失敗しました'); const failed = data.results.filter(result => !result.ok); $('announceStatus').textContent = '完了: ' + data.sent + '件成功 / ' + data.total + '件中' + failed.length + '件失敗' + (failed.length ? '。詳細はブラウザの開発者コンソールを確認してください。' : ''); if (failed.length) console.warn('配信失敗', failed); } catch (error) { $('announceStatus').textContent = error.message; } finally { $('announceButton').disabled = false; } });
-        $('search').addEventListener('input', render); $('refresh').addEventListener('click', () => { load(); loadGuilds(); }); $('revokeAll').addEventListener('click', async () => { if (!confirm('有効な認証を最大100件まで失効させ、保存データを削除します。続行しますか？')) return; $('revokeAll').disabled = true; try { const response = await fetch('/admin/unlink-all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }); const message = await response.text(); if (!response.ok) throw new Error(message); alert(message); await load(); await loadGuilds(); } catch (error) { alert(error.message); } finally { $('revokeAll').disabled = false; } }); load(); loadGuilds();
+        let dmConversations = [];
+        let selectedDmUserId = null;
+        function renderDmThread() { const conversation = dmConversations.find(item => item.user_id === selectedDmUserId); $('dmThread').replaceChildren(); if (!conversation) { $('dmThread').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: 'DMを選択してください。' })); return; } conversation.messages.forEach(message => { const item = document.createElement('div'); item.className = 'dm-message' + (message.from_admin ? ' admin' : ''); const meta = document.createElement('div'); meta.className = 'dm-message-meta'; meta.textContent = (message.from_admin ? '管理者' : '相手') + ' · ' + new Date(message.created_at * 1000).toLocaleString('ja-JP'); const content = document.createElement('div'); content.textContent = message.content; item.append(meta, content); $('dmThread').append(item); }); $('dmThread').scrollTop = $('dmThread').scrollHeight; }
+        function renderDmUsers() { $('dmUsers').replaceChildren(); dmConversations.forEach(conversation => { const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-user' + (conversation.user_id === selectedDmUserId ? ' selected' : ''); button.textContent = conversation.user_id + (conversation.unread ? ' · 新着' : ''); button.onclick = () => { selectedDmUserId = conversation.user_id; renderDmUsers(); renderDmThread(); }; $('dmUsers').append(button); }); if (!dmConversations.length) $('dmUsers').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: '受信した DM はありません。' })); }
+        async function loadDmInbox() { try { const response = await fetch('/admin/dm/inbox', { headers: { 'X-CSRF-Token': csrfToken } }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DMの取得に失敗しました'); dmConversations = data.conversations || []; if (!dmConversations.some(item => item.user_id === selectedDmUserId)) selectedDmUserId = dmConversations[0]?.user_id || null; renderDmUsers(); renderDmThread(); $('dmStatus').textContent = '最終確認: ' + new Date().toLocaleTimeString('ja-JP'); } catch (error) { $('dmStatus').textContent = error.message; } }
+        $('dmReply').addEventListener('submit', async (event) => { event.preventDefault(); if (!selectedDmUserId) return; const content = $('dmReplyContent').value.trim(); if (!content) return; $('dmReplyButton').disabled = true; try { const response = await fetch('/admin/dm/reply', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ user_id: selectedDmUserId, content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '返信に失敗しました'); $('dmReplyContent').value = ''; await loadDmInbox(); } catch (error) { alert(error.message); } finally { $('dmReplyButton').disabled = false; } });
+        $('announceForm').addEventListener('submit', async (event) => { event.preventDefault(); const content = $('announcement').value.trim(); if (!content || !confirm('全サーバー管理者へ DM を送信しますか？')) return; $('announceButton').disabled = true; $('announceStatus').textContent = '送信中...'; try { const response = await fetch('/admin/announce', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DM送信に失敗しました'); const failed = data.results.filter(result => !result.ok); $('announceStatus').textContent = '完了: ' + data.sent + 'サーバー成功 / ' + data.total + 'サーバー中' + failed.length + 'サーバー失敗' + (failed.length ? '。詳細はブラウザの開発者コンソールを確認してください。' : ''); if (failed.length) console.warn('DM送信失敗', failed); } catch (error) { $('announceStatus').textContent = error.message; } finally { $('announceButton').disabled = false; } });
+        $('search').addEventListener('input', render); $('refresh').addEventListener('click', () => { load(); loadGuilds(); loadDmInbox(); }); $('revokeAll').addEventListener('click', async () => { if (!confirm('有効な認証を最大100件まで失効させ、保存データを削除します。続行しますか？')) return; $('revokeAll').disabled = true; try { const response = await fetch('/admin/unlink-all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }); const message = await response.text(); if (!response.ok) throw new Error(message); alert(message); await load(); await loadGuilds(); } catch (error) { alert(error.message); } finally { $('revokeAll').disabled = false; } }); load(); loadGuilds(); loadDmInbox();
       </script>
     </body>
     </html>`;
@@ -1770,41 +1967,22 @@ async function announceToAllGuilds(content, env) {
   const results = [];
 
   for (const guild of guilds) {
-    const channels = await getBotGuildChannels(env, guild.id);
-    if (!channels.ok) {
-      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: channels.error });
+    const administrators = await getGuildAdministrators(env, guild.id);
+    if (!administrators.ok) {
+      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: administrators.error });
       continue;
     }
 
-    const announcementChannels = channels.channels
-      .filter(channel => channel.type === 5)
-      .sort(compareDiscordChannels);
-    const textChannels = channels.channels
-      .filter(channel => channel.type === 0)
-      .sort(compareDiscordChannels);
-    const channel = announcementChannels[0] || textChannels[0];
-    if (!channel) {
-      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: "配信可能なチャンネルがありません。" });
+    const dmResults = [];
+    for (const administrator of administrators.members) {
+      dmResults.push(await sendDirectMessage(administrator.id, content, env));
+    }
+    const failed = dmResults.filter(result => !result.ok);
+    if (dmResults.length === 0) {
+      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: "管理者メンバーを取得できませんでした。" });
       continue;
     }
-
-    try {
-      const response = await fetchWithTimeout(`https://discord.com/api/v10/channels/${channel.id}/messages`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ content })
-      });
-      if (!response.ok) {
-        results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: response.status === 403 ? "Botにメッセージ送信権限がありません。" : `Discord APIエラー (${response.status})` });
-        continue;
-      }
-      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", channel_id: channel.id, channel_name: channel.name, ok: true });
-    } catch (e) {
-      results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", ok: false, error: "Discord APIへの接続に失敗しました。" });
-    }
+    results.push({ guild_id: guild.id, guild_name: guild.name || "名前なしサーバー", administrators: administrators.members.length, ok: failed.length === 0, error: failed.length ? "一部の管理者へ DM を送信できませんでした。" : null });
   }
 
   return {
@@ -1812,6 +1990,262 @@ async function announceToAllGuilds(content, env) {
     sent: results.filter(result => result.ok).length,
     results
   };
+}
+
+async function notifyNewGuilds(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS guild_installations (
+      guild_id TEXT PRIMARY KEY,
+      guild_name TEXT,
+      welcome_sent_at INTEGER
+    )`
+  ).run();
+
+  const guilds = await getBotGuilds(env);
+  for (const guild of guilds) {
+    const existing = await env.DB.prepare(
+      "SELECT welcome_sent_at FROM guild_installations WHERE guild_id = ?"
+    ).bind(guild.id).first();
+    if (existing?.welcome_sent_at) continue;
+
+    const administrators = await getGuildAdministrators(env, guild.id);
+    if (!administrators.ok || administrators.members.length === 0) continue;
+
+    let sent = 0;
+    for (const administrator of administrators.members) {
+      const result = await sendDirectMessage(administrator.id, WELCOME_MESSAGE, env);
+      if (result.ok) sent++;
+    }
+    if (sent > 0) {
+      const now = Math.floor(Date.now() / 1000);
+      await env.DB.prepare(
+        `INSERT INTO guild_installations (guild_id, guild_name, welcome_sent_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(guild_id) DO UPDATE SET guild_name = ?, welcome_sent_at = ?`
+      ).bind(guild.id, guild.name || "名前なしサーバー", now, guild.name || "名前なしサーバー", now).run();
+    }
+  }
+}
+
+async function sendDirectMessage(userId, content, env) {
+  if (!env.DISCORD_BOT_TOKEN || !/^\d{17,20}$/.test(userId || "")) {
+    return { ok: false, error: "DM送信先またはBotトークンが不正です。" };
+  }
+
+  try {
+    const channelResponse = await fetchWithTimeout("https://discord.com/api/v10/users/@me/channels", {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ recipient_id: userId })
+    });
+    if (!channelResponse.ok) {
+      return { ok: false, error: channelResponse.status === 403 ? "DMが許可されていません。" : `Discord APIエラー (${channelResponse.status})` };
+    }
+
+    const channel = await channelResponse.json();
+    const messageResponse = await fetchWithTimeout(`https://discord.com/api/v10/channels/${channel.id}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ content })
+    });
+    if (messageResponse.ok) {
+      const message = await messageResponse.json();
+      return { ok: true, user_id: userId, message_id: message.id };
+    }
+    return { ok: false, error: messageResponse.status === 403 ? "DMが許可されていません。" : `Discord APIエラー (${messageResponse.status})` };
+  } catch (e) {
+    return { ok: false, error: "Discord APIへの接続に失敗しました。" };
+  }
+}
+
+async function ensureAdminDmTables(env) {
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS admin_dm_channels (
+      user_id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      last_message_id TEXT,
+      updated_at INTEGER NOT NULL
+    )`
+  ).run();
+  await env.DB.prepare(
+    `CREATE TABLE IF NOT EXISTS admin_dm_messages (
+      message_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      from_admin INTEGER NOT NULL,
+      created_at INTEGER NOT NULL
+    )`
+  ).run();
+}
+
+async function pollAdminDirectMessages(env) {
+  await ensureAdminDmTables(env);
+  const guilds = await getBotGuilds(env);
+  const administratorIds = new Set();
+  for (const guild of guilds) {
+    const administrators = await getGuildAdministrators(env, guild.id);
+    if (!administrators.ok) continue;
+    for (const administrator of administrators.members) administratorIds.add(administrator.id);
+  }
+
+  for (const userId of administratorIds) {
+    if (userId === ADMIN_DISCORD_ID) continue;
+    const channel = await getDirectMessageChannel(userId, env);
+    if (!channel.ok) continue;
+      const cursor = await env.DB.prepare(
+      "SELECT last_message_id FROM admin_dm_channels WHERE user_id = ?"
+    ).bind(userId).first();
+    const isInitialSync = !cursor?.last_message_id;
+    const messages = await getDirectMessages(channel.channel_id, cursor?.last_message_id, env);
+    if (!messages.ok) continue;
+
+    for (const message of messages.messages) {
+      const fromAdmin = message.author?.id === ADMIN_DISCORD_ID;
+      await saveAdminDmMessage(env, message.id, userId, message.content || "", fromAdmin, message.timestamp);
+      if (!isInitialSync && !fromAdmin && message.author?.bot !== true) {
+        await sendDirectMessage(ADMIN_DISCORD_ID, `【管理者 DM 受信】\n送信者: <@${userId}>\n\n${message.content || "(本文なし)"}`, env);
+      }
+    }
+    const latestMessageId = messages.messages[messages.messages.length - 1]?.id || cursor?.last_message_id || null;
+    await env.DB.prepare(
+      `INSERT INTO admin_dm_channels (user_id, channel_id, last_message_id, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET channel_id = ?, last_message_id = ?, updated_at = ?`
+    ).bind(userId, channel.channel_id, latestMessageId, Math.floor(Date.now() / 1000), channel.channel_id, latestMessageId, Math.floor(Date.now() / 1000)).run();
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT user_id, message_id, content, from_admin, created_at
+     FROM admin_dm_messages ORDER BY created_at ASC LIMIT 1000`
+  ).all();
+  const conversations = new Map();
+  for (const message of results || []) {
+    if (!conversations.has(message.user_id)) conversations.set(message.user_id, { user_id: message.user_id, unread: false, messages: [] });
+    conversations.get(message.user_id).messages.push({
+      message_id: message.message_id,
+      content: message.content,
+      from_admin: Boolean(message.from_admin),
+      created_at: message.created_at
+    });
+  }
+  return { conversations: [...conversations.values()] };
+}
+
+async function getDirectMessageChannel(userId, env) {
+  try {
+    const response = await fetchWithTimeout("https://discord.com/api/v10/users/@me/channels", {
+      method: "POST",
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ recipient_id: userId })
+    });
+    if (!response.ok) return { ok: false, channel_id: null };
+    const channel = await response.json();
+    return { ok: Boolean(channel?.id), channel_id: channel?.id || null };
+  } catch (e) {
+    return { ok: false, channel_id: null };
+  }
+}
+
+async function getDirectMessages(channelId, after, env) {
+  try {
+    const query = after ? `?limit=100&after=${encodeURIComponent(after)}` : "?limit=100";
+    const response = await fetchWithTimeout(`https://discord.com/api/v10/channels/${channelId}/messages${query}`, {
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
+    });
+    if (!response.ok) return { ok: false, messages: [] };
+    const messages = await response.json();
+    if (!Array.isArray(messages)) return { ok: false, messages: [] };
+    return { ok: true, messages: messages.reverse() };
+  } catch (e) {
+    return { ok: false, messages: [] };
+  }
+}
+
+async function saveAdminDmMessage(env, messageId, userId, content, fromAdmin, timestamp = null) {
+  if (!messageId) return false;
+  const createdAt = timestamp ? Math.floor(new Date(timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
+  const result = await env.DB.prepare(
+    `INSERT OR IGNORE INTO admin_dm_messages (message_id, user_id, content, from_admin, created_at)
+     VALUES (?, ?, ?, ?, ?)`
+  ).bind(messageId, userId, content, fromAdmin ? 1 : 0, createdAt).run();
+  return result?.meta?.changes === 1;
+}
+
+async function getGuildAdministrators(env, guildId) {
+  if (!env.DISCORD_BOT_TOKEN || !/^\d{17,20}$/.test(guildId || "")) {
+    return { ok: false, error: "サーバーまたはBotトークンが不正です。", members: [] };
+  }
+
+  try {
+    const guildResponse = await fetchWithTimeout(`https://discord.com/api/v10/guilds/${guildId}`, {
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
+    });
+    if (!guildResponse.ok) {
+      return { ok: false, error: guildResponse.status === 403 ? "Botにサーバー情報の閲覧権限がありません。" : `Discord APIエラー (${guildResponse.status})`, members: [] };
+    }
+    const guild = await guildResponse.json();
+    const administrators = new Map();
+    if (/^\d{17,20}$/.test(guild.owner_id || "")) administrators.set(guild.owner_id, { id: guild.owner_id });
+
+    const rolesResponse = await fetchWithTimeout(`https://discord.com/api/v10/guilds/${guildId}/roles`, {
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
+    });
+    if (!rolesResponse.ok) {
+      return { ok: false, error: rolesResponse.status === 403 ? "Botにロール情報の閲覧権限がありません。" : `Discord APIエラー (${rolesResponse.status})`, members: [] };
+    }
+    const roles = await rolesResponse.json();
+    if (!Array.isArray(roles)) return { ok: false, error: "Discordのロール情報が不正です。", members: [] };
+    const administratorRoleIds = new Set();
+    for (const role of roles) {
+      try {
+        if ((BigInt(String(role.permissions || "0")) & DISCORD_ADMINISTRATOR_PERMISSION) !== 0n) {
+          administratorRoleIds.add(role.id);
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+
+    let after = "0";
+    while (true) {
+      const response = await fetchWithTimeout(`https://discord.com/api/v10/guilds/${guildId}/members?limit=1000&after=${after}`, {
+        headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
+      });
+      if (!response.ok) {
+        return { ok: false, error: response.status === 403 ? "Botにメンバー情報の閲覧権限がありません。" : `Discord APIエラー (${response.status})`, members: [] };
+      }
+      const members = await response.json();
+      if (!Array.isArray(members)) return { ok: false, error: "Discordのメンバー情報が不正です。", members: [] };
+      for (const member of members) {
+        const userId = member.user?.id;
+        if (!userId) continue;
+        let isAdministrator = false;
+        try {
+          isAdministrator = (BigInt(String(member.permissions || "0")) & DISCORD_ADMINISTRATOR_PERMISSION) !== 0n;
+        } catch (e) {
+          isAdministrator = false;
+        }
+        if (!isAdministrator && Array.isArray(member.roles)) {
+          isAdministrator = member.roles.some(roleId => administratorRoleIds.has(roleId));
+        }
+        if (isAdministrator) administrators.set(userId, { id: userId });
+      }
+      if (members.length < 1000) break;
+      const lastId = members[members.length - 1]?.user?.id;
+      if (!lastId || lastId === after) break;
+      after = lastId;
+    }
+
+    return { ok: true, error: null, members: [...administrators.values()] };
+  } catch (e) {
+    return { ok: false, error: "Discord APIへの接続に失敗しました。", members: [] };
+  }
 }
 
 function compareDiscordChannels(left, right) {
