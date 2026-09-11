@@ -697,7 +697,8 @@ export default {
 async function handleDiscordInteraction(request, env, ctx) {
   const signature = request.headers.get("X-Signature-Ed25519");
   const timestamp = request.headers.get("X-Signature-Timestamp");
-  if (!signature || !timestamp || !env.DISCORD_PUBLIC_KEY) {
+  const publicKey = typeof env.DISCORD_PUBLIC_KEY === "string" ? env.DISCORD_PUBLIC_KEY.trim() : "";
+  if (!signature || !timestamp || !publicKey) {
     return new Response("署名検証の設定がありません。", { status: 401 });
   }
 
@@ -710,7 +711,7 @@ async function handleDiscordInteraction(request, env, ctx) {
     return new Response("リクエストが大きすぎます。", { status: 413 });
   }
 
-  if (!await verifyDiscordInteractionSignature(rawBody, signature, timestamp, env.DISCORD_PUBLIC_KEY)) {
+  if (!await verifyDiscordInteractionSignature(rawBody, signature.trim(), timestamp.trim(), publicKey)) {
     return new Response("署名検証に失敗しました。", { status: 401 });
   }
 
