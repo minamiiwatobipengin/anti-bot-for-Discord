@@ -1429,8 +1429,12 @@ function renderAdminDashboard(csrfToken) {
         .dm-panel { margin-bottom: 20px; padding: 20px; background: rgba(22, 27, 34, .9); border: 1px solid var(--line); border-radius: 12px; }
         .dm-grid { display: grid; grid-template-columns: minmax(220px, .7fr) minmax(320px, 1.3fr); gap: 14px; }
         .dm-users, .dm-thread { min-height: 180px; max-height: 420px; overflow-y: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
-        .dm-user { display: block; width: 100%; padding: 12px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; text-align: left; }
+        .dm-user { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; text-align: left; }
         .dm-user.selected { border-left: 3px solid var(--blue); background: var(--panel-2); }
+        .dm-user-avatar { width: 28px; height: 28px; border-radius: 50%; flex-shrink: 0; object-fit: cover; background: var(--bg); }
+        .dm-user-info { min-width: 0; }
+        .dm-user-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .dm-user-id { display: block; color: var(--muted); font-size: 11px; }
         .dm-message { padding: 10px 12px; border-bottom: 1px solid var(--line); }
         .dm-message.admin { background: rgba(35, 134, 54, .16); }
         .dm-message-meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
@@ -1562,8 +1566,8 @@ function renderAdminDashboard(csrfToken) {
         async function revokeUser(user, button) { if (!confirm(user.display_name + ' の認証を失効させますか？')) return; button.disabled = true; try { const response = await fetch('/admin/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ discord_id: user.discord_id, guild_id: user.guild_id }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '失効に失敗しました'); users = users.filter(item => !(item.discord_id === user.discord_id && item.guild_id === user.guild_id)); $('total').textContent = users.length; $('active').textContent = users.filter(item => item.expires_at * 1000 > Date.now()).length; render(); } catch (error) { alert(error.message); button.disabled = false; } }
         let dmConversations = [];
         let selectedDmUserId = null;
-        function renderDmThread() { const conversation = dmConversations.find(item => item.user_id === selectedDmUserId); $('dmThread').replaceChildren(); if (!conversation) { $('dmThread').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: 'DMを選択してください。' })); return; } conversation.messages.forEach(message => { const item = document.createElement('div'); item.className = 'dm-message' + (message.from_admin ? ' admin' : ''); const meta = document.createElement('div'); meta.className = 'dm-message-meta'; meta.textContent = (message.from_admin ? '管理者' : '相手') + ' · ' + new Date(message.created_at * 1000).toLocaleString('ja-JP'); const content = document.createElement('div'); content.textContent = message.content; item.append(meta, content); $('dmThread').append(item); }); $('dmThread').scrollTop = $('dmThread').scrollHeight; }
-        function renderDmUsers() { $('dmUsers').replaceChildren(); dmConversations.forEach(conversation => { const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-user' + (conversation.user_id === selectedDmUserId ? ' selected' : ''); button.textContent = conversation.user_id + (conversation.unread ? ' · 新着' : ''); button.onclick = () => { selectedDmUserId = conversation.user_id; renderDmUsers(); renderDmThread(); }; $('dmUsers').append(button); }); if (!dmConversations.length) $('dmUsers').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: '受信した DM はありません。' })); }
+        function renderDmThread() { const conversation = dmConversations.find(item => item.user_id === selectedDmUserId); $('dmThread').replaceChildren(); if (!conversation) { $('dmThread').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: 'DMを選択してください。' })); return; } conversation.messages.forEach(message => { const item = document.createElement('div'); item.className = 'dm-message' + (message.from_admin ? ' admin' : ''); const meta = document.createElement('div'); meta.className = 'dm-message-meta'; meta.textContent = (message.from_admin ? '管理者' : (conversation.username || '相手')) + ' · ' + new Date(message.created_at * 1000).toLocaleString('ja-JP'); const content = document.createElement('div'); content.textContent = message.content; item.append(meta, content); $('dmThread').append(item); }); $('dmThread').scrollTop = $('dmThread').scrollHeight; }
+        function renderDmUsers() { $('dmUsers').replaceChildren(); dmConversations.forEach(conversation => { const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-user' + (conversation.user_id === selectedDmUserId ? ' selected' : ''); const avatar = document.createElement('img'); avatar.className = 'dm-user-avatar'; avatar.src = conversation.avatar || 'https://cdn.discordapp.com/embed/avatars/0.png'; avatar.alt = ''; const info = document.createElement('div'); info.className = 'dm-user-info'; const name = document.createElement('span'); name.className = 'dm-user-name'; name.textContent = (conversation.username || '不明なユーザー') + (conversation.unread ? ' · 新着' : ''); const id = document.createElement('span'); id.className = 'dm-user-id'; id.textContent = conversation.user_id; info.append(name, id); button.append(avatar, info); button.onclick = () => { selectedDmUserId = conversation.user_id; renderDmUsers(); renderDmThread(); }; $('dmUsers').append(button); }); if (!dmConversations.length) $('dmUsers').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: '受信した DM はありません。' })); }
         async function loadDmInbox() { try { const response = await fetch('/admin/dm/inbox', { headers: { 'X-CSRF-Token': csrfToken } }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DMの取得に失敗しました'); dmConversations = data.conversations || []; if (!dmConversations.some(item => item.user_id === selectedDmUserId)) selectedDmUserId = dmConversations[0]?.user_id || null; renderDmUsers(); renderDmThread(); $('dmStatus').textContent = '最終確認: ' + new Date().toLocaleTimeString('ja-JP'); } catch (error) { $('dmStatus').textContent = error.message; } }
         $('dmReply').addEventListener('submit', async (event) => { event.preventDefault(); if (!selectedDmUserId) return; const content = $('dmReplyContent').value.trim(); if (!content) return; $('dmReplyButton').disabled = true; try { const response = await fetch('/admin/dm/reply', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ user_id: selectedDmUserId, content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '返信に失敗しました'); $('dmReplyContent').value = ''; await loadDmInbox(); } catch (error) { alert(error.message); } finally { $('dmReplyButton').disabled = false; } });
         $('announceForm').addEventListener('submit', async (event) => { event.preventDefault(); const content = $('announcement').value.trim(); if (!content || !confirm('全サーバー管理者へ DM を送信しますか？')) return; $('announceButton').disabled = true; $('announceStatus').textContent = '送信中...'; try { const response = await fetch('/admin/announce', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DM送信に失敗しました'); const failed = data.results.filter(result => !result.ok); $('announceStatus').textContent = '完了: ' + data.sent + 'サーバー成功 / ' + data.total + 'サーバー中' + failed.length + 'サーバー失敗' + (failed.length ? '。詳細はブラウザの開発者コンソールを確認してください。' : ''); if (failed.length) console.warn('DM送信失敗', failed); } catch (error) { $('announceStatus').textContent = error.message; } finally { $('announceButton').disabled = false; } });
@@ -2034,9 +2038,14 @@ async function ensureAdminDmTables(env) {
       user_id TEXT PRIMARY KEY,
       channel_id TEXT NOT NULL,
       last_message_id TEXT,
+      username TEXT,
+      avatar TEXT,
       updated_at INTEGER NOT NULL
     )`
   ).run();
+  // 旧バージョンで作成済みのテーブルにも列を追加する（既に存在する場合はエラーを無視）
+  try { await env.DB.prepare(`ALTER TABLE admin_dm_channels ADD COLUMN username TEXT`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE admin_dm_channels ADD COLUMN avatar TEXT`).run(); } catch (e) {}
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS admin_dm_messages (
       message_id TEXT PRIMARY KEY,
@@ -2062,43 +2071,80 @@ async function pollAdminDirectMessages(env) {
     if (userId === ADMIN_DISCORD_ID) continue;
     const channel = await getDirectMessageChannel(userId, env);
     if (!channel.ok) continue;
-      const cursor = await env.DB.prepare(
-      "SELECT last_message_id FROM admin_dm_channels WHERE user_id = ?"
+    const cursor = await env.DB.prepare(
+      "SELECT last_message_id, username, avatar FROM admin_dm_channels WHERE user_id = ?"
     ).bind(userId).first();
     const isInitialSync = !cursor?.last_message_id;
     const messages = await getDirectMessages(channel.channel_id, cursor?.last_message_id, env);
     if (!messages.ok) continue;
 
     for (const message of messages.messages) {
-      const fromAdmin = message.author?.id === ADMIN_DISCORD_ID;
-      await saveAdminDmMessage(env, message.id, userId, message.content || "", fromAdmin, message.timestamp);
-      if (!isInitialSync && !fromAdmin && message.author?.bot !== true) {
+      // Bot自身が送信したメッセージ（自動あいさつ・管理者からの返信など）かどうかを判定する。
+      // 旧実装は message.author.id === ADMIN_DISCORD_ID で判定していたが、
+      // 管理者の返信もBotトークン経由で送られるため常にBot自身が author になり、
+      // 実際にはこちらから送っただけのメッセージが「相手からの返信」として扱われていた。
+      const isFromBot = message.author?.bot === true;
+      await saveAdminDmMessage(env, message.id, userId, message.content || "", isFromBot, message.timestamp);
+      if (!isInitialSync && !isFromBot) {
         await sendDirectMessage(ADMIN_DISCORD_ID, `【管理者 DM 受信】\n送信者: <@${userId}>\n\n${message.content || "(本文なし)"}`, env);
       }
     }
+
+    // ユーザー名・アバターを未取得の場合のみ取得してキャッシュする
+    let username = cursor?.username || null;
+    let avatar = cursor?.avatar || null;
+    if (!username) {
+      const userInfo = await getDiscordUserById(userId, env);
+      if (userInfo) {
+        username = userInfo.username || username;
+        avatar = userInfo.avatar_url || avatar;
+      }
+    }
+
     const latestMessageId = messages.messages[messages.messages.length - 1]?.id || cursor?.last_message_id || null;
     await env.DB.prepare(
-      `INSERT INTO admin_dm_channels (user_id, channel_id, last_message_id, updated_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET channel_id = ?, last_message_id = ?, updated_at = ?`
-    ).bind(userId, channel.channel_id, latestMessageId, Math.floor(Date.now() / 1000), channel.channel_id, latestMessageId, Math.floor(Date.now() / 1000)).run();
+      `INSERT INTO admin_dm_channels (user_id, channel_id, last_message_id, username, avatar, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET channel_id = ?, last_message_id = ?, username = ?, avatar = ?, updated_at = ?`
+    ).bind(
+      userId, channel.channel_id, latestMessageId, username, avatar, Math.floor(Date.now() / 1000),
+      channel.channel_id, latestMessageId, username, avatar, Math.floor(Date.now() / 1000)
+    ).run();
   }
 
   const { results } = await env.DB.prepare(
-    `SELECT user_id, message_id, content, from_admin, created_at
-     FROM admin_dm_messages ORDER BY created_at ASC LIMIT 1000`
+    `SELECT m.user_id, m.message_id, m.content, m.from_admin, m.created_at,
+            c.username, c.avatar
+     FROM admin_dm_messages m
+     LEFT JOIN admin_dm_channels c ON c.user_id = m.user_id
+     ORDER BY m.created_at ASC LIMIT 1000`
   ).all();
   const conversations = new Map();
   for (const message of results || []) {
-    if (!conversations.has(message.user_id)) conversations.set(message.user_id, { user_id: message.user_id, unread: false, messages: [] });
-    conversations.get(message.user_id).messages.push({
+    if (!conversations.has(message.user_id)) {
+      conversations.set(message.user_id, {
+        user_id: message.user_id,
+        username: message.username || null,
+        avatar: message.avatar || null,
+        has_reply: false,
+        unread: false,
+        messages: []
+      });
+    }
+    const conversation = conversations.get(message.user_id);
+    if (!message.from_admin) conversation.has_reply = true;
+    conversation.messages.push({
       message_id: message.message_id,
       content: message.content,
       from_admin: Boolean(message.from_admin),
       created_at: message.created_at
     });
   }
-  return { conversations: [...conversations.values()] };
+
+  // 一度も相手から返信が来ておらず、こちらから送っただけ（あいさつメッセージ等）の
+  // スレッドは受信箱に出すと分かりにくいので除外する
+  const activeConversations = [...conversations.values()].filter(conversation => conversation.has_reply);
+  return { conversations: activeConversations };
 }
 
 async function getDirectMessageChannel(userId, env) {
@@ -2113,6 +2159,27 @@ async function getDirectMessageChannel(userId, env) {
     return { ok: Boolean(channel?.id), channel_id: channel?.id || null };
   } catch (e) {
     return { ok: false, channel_id: null };
+  }
+}
+
+async function getDiscordUserById(userId, env) {
+  if (!env.DISCORD_BOT_TOKEN || !/^\d{17,20}$/.test(userId || "")) return null;
+  try {
+    const response = await fetchWithTimeout(`https://discord.com/api/v10/users/${userId}`, {
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
+    });
+    if (!response.ok) return null;
+    const user = await response.json();
+    if (!user?.id) return null;
+    return {
+      id: user.id,
+      username: user.global_name || user.username || null,
+      avatar_url: user.avatar
+        ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64`
+        : null
+    };
+  } catch (e) {
+    return null;
   }
 }
 
