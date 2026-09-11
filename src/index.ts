@@ -786,42 +786,6 @@ function decodeHex(value) {
   return bytes;
 }
 
-async function ensureSupportCommand(env) {
-  if (!env.DISCORD_BOT_TOKEN || !env.DISCORD_CLIENT_ID) return;
-
-  try {
-    const commandsUrl = `https://discord.com/api/v10/applications/${env.DISCORD_CLIENT_ID}/commands`;
-    const headers = {
-      Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
-      "Content-Type": "application/json"
-    };
-    const existingResponse = await fetchWithTimeout(commandsUrl, { headers });
-    const existingPayload = existingResponse.ok ? await existingResponse.json() : [];
-    const existingCommands = Array.isArray(existingPayload) ? existingPayload : [];
-    const commands = existingCommands.filter(command => command.name !== DISCORD_INTERACTION_COMMAND);
-    commands.push({
-      name: DISCORD_INTERACTION_COMMAND,
-      description: "認証サービスの管理者へ問い合わせます",
-      default_member_permissions: String(DISCORD_ADMINISTRATOR_PERMISSION),
-      dm_permission: false,
-      options: [{
-        type: 3,
-        name: "content",
-        description: "問い合わせ内容",
-        required: true,
-        max_length: MAX_ANNOUNCEMENT_LENGTH
-      }]
-    });
-    await fetchWithTimeout(commandsUrl, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify(commands)
-    });
-  } catch (e) {
-    console.error("Support command registration failed");
-  }
-}
-
 async function getSession(env, sessionId) {
   if (!sessionId || !/^[0-9a-f-]{36}$/.test(sessionId)) return null;
 
