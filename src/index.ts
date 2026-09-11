@@ -1567,7 +1567,7 @@ function renderAdminDashboard(csrfToken) {
         let dmConversations = [];
         let selectedDmUserId = null;
         function renderDmThread() { const conversation = dmConversations.find(item => item.user_id === selectedDmUserId); $('dmThread').replaceChildren(); if (!conversation) { $('dmThread').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: 'DMを選択してください。' })); return; } conversation.messages.forEach(message => { const item = document.createElement('div'); item.className = 'dm-message' + (message.from_admin ? ' admin' : ''); const meta = document.createElement('div'); meta.className = 'dm-message-meta'; meta.textContent = (message.from_admin ? '管理者' : (conversation.username || '相手')) + ' · ' + new Date(message.created_at * 1000).toLocaleString('ja-JP'); const content = document.createElement('div'); content.textContent = message.content; item.append(meta, content); $('dmThread').append(item); }); $('dmThread').scrollTop = $('dmThread').scrollHeight; }
-        function renderDmUsers() { $('dmUsers').replaceChildren(); dmConversations.forEach(conversation => { const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-user' + (conversation.user_id === selectedDmUserId ? ' selected' : ''); const avatar = document.createElement('img'); avatar.className = 'dm-user-avatar'; avatar.src = conversation.avatar || 'https://cdn.discordapp.com/embed/avatars/0.png'; avatar.alt = ''; const info = document.createElement('div'); info.className = 'dm-user-info'; const name = document.createElement('span'); name.className = 'dm-user-name'; name.textContent = (conversation.username || '不明なユーザー') + (conversation.unread ? ' · 新着' : ''); const id = document.createElement('span'); id.className = 'dm-user-id'; id.textContent = conversation.user_id; info.append(name, id); button.append(avatar, info); button.onclick = () => { selectedDmUserId = conversation.user_id; renderDmUsers(); renderDmThread(); }; $('dmUsers').append(button); }); if (!dmConversations.length) $('dmUsers').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: '受信した DM はありません。' })); }
+        function renderDmUsers() { $('dmUsers').replaceChildren(); dmConversations.forEach(conversation => { const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-user' + (conversation.user_id === selectedDmUserId ? ' selected' : ''); const avatar = document.createElement('img'); avatar.className = 'dm-user-avatar'; avatar.src = conversation.avatar || '/admin/avatar?default=1'; avatar.alt = ''; const info = document.createElement('div'); info.className = 'dm-user-info'; const name = document.createElement('span'); name.className = 'dm-user-name'; name.textContent = (conversation.username || '不明なユーザー') + (conversation.unread ? ' · 新着' : ''); const id = document.createElement('span'); id.className = 'dm-user-id'; id.textContent = conversation.user_id; info.append(name, id); button.append(avatar, info); button.onclick = () => { selectedDmUserId = conversation.user_id; renderDmUsers(); renderDmThread(); }; $('dmUsers').append(button); }); if (!dmConversations.length) $('dmUsers').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: '受信した DM はありません。' })); }
         async function loadDmInbox() { try { const response = await fetch('/admin/dm/inbox', { headers: { 'X-CSRF-Token': csrfToken } }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DMの取得に失敗しました'); dmConversations = data.conversations || []; if (!dmConversations.some(item => item.user_id === selectedDmUserId)) selectedDmUserId = dmConversations[0]?.user_id || null; renderDmUsers(); renderDmThread(); $('dmStatus').textContent = '最終確認: ' + new Date().toLocaleTimeString('ja-JP'); } catch (error) { $('dmStatus').textContent = error.message; } }
         $('dmReply').addEventListener('submit', async (event) => { event.preventDefault(); if (!selectedDmUserId) return; const content = $('dmReplyContent').value.trim(); if (!content) return; $('dmReplyButton').disabled = true; try { const response = await fetch('/admin/dm/reply', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ user_id: selectedDmUserId, content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '返信に失敗しました'); $('dmReplyContent').value = ''; await loadDmInbox(); } catch (error) { alert(error.message); } finally { $('dmReplyButton').disabled = false; } });
         $('announceForm').addEventListener('submit', async (event) => { event.preventDefault(); const content = $('announcement').value.trim(); if (!content || !confirm('全サーバー管理者へ DM を送信しますか？')) return; $('announceButton').disabled = true; $('announceStatus').textContent = '送信中...'; try { const response = await fetch('/admin/announce', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DM送信に失敗しました'); const failed = data.results.filter(result => !result.ok); $('announceStatus').textContent = '完了: ' + data.sent + 'サーバー成功 / ' + data.total + 'サーバー中' + failed.length + 'サーバー失敗' + (failed.length ? '。詳細はブラウザの開発者コンソールを確認してください。' : ''); if (failed.length) console.warn('DM送信失敗', failed); } catch (error) { $('announceStatus').textContent = error.message; } finally { $('announceButton').disabled = false; } });
@@ -1836,6 +1836,33 @@ async function fetchWithTimeout(input, init = {}) {
   }
 }
 
+// DM同期処理はユーザー数が多いと短時間に大量のDiscord APIリクエストを送るため、
+// 429（レート制限）が発生しやすい。何もリトライしないと、レート制限に当たった
+// ユーザーだけ「取得失敗→不明なユーザー扱い／受信箱に出ない」という不具合になる。
+// Retry-After（またはbody.retry_after）に従って待ってから再試行する。
+async function fetchDiscordApiWithRetry(input, init = {}, maxRetries = 3) {
+  let response;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    response = await fetchWithTimeout(input, init);
+    if (response.status !== 429 || attempt === maxRetries) return response;
+
+    let retryAfterMs = 1000 * (attempt + 1);
+    try {
+      const header = response.headers.get("Retry-After");
+      if (header) {
+        retryAfterMs = Math.ceil(parseFloat(header) * 1000);
+      } else {
+        const body = await response.clone().json();
+        if (typeof body?.retry_after === "number") retryAfterMs = Math.ceil(body.retry_after * 1000);
+      }
+    } catch (e) {
+      // ヘッダー/ボディが読めない場合は既定のバックオフ秒数を使う
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(Math.max(retryAfterMs, 250), 5000)));
+  }
+  return response;
+}
+
 async function exchangeCode(code, env) {
   try {
     const params = new URLSearchParams({
@@ -1931,6 +1958,7 @@ async function getBotGuilds(env) {
 }
 
 async function announceToAllGuilds(content, env) {
+  await ensureAdminDmTables(env);
   const guilds = await getBotGuilds(env);
   const results = [];
 
@@ -1943,7 +1971,11 @@ async function announceToAllGuilds(content, env) {
 
     const dmResults = [];
     for (const administrator of administrators.members) {
-      dmResults.push(await sendDirectMessage(administrator.id, content, env));
+      const result = await sendDirectMessage(administrator.id, content, env);
+      dmResults.push(result);
+      if (result.ok) {
+        await saveAdminDmMessage(env, result.message_id, administrator.id, content, true, null, true);
+      }
     }
     const failed = dmResults.filter(result => !result.ok);
     if (dmResults.length === 0) {
@@ -1961,6 +1993,7 @@ async function announceToAllGuilds(content, env) {
 }
 
 async function notifyNewGuilds(env) {
+  await ensureAdminDmTables(env);
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS guild_installations (
       guild_id TEXT PRIMARY KEY,
@@ -1982,7 +2015,10 @@ async function notifyNewGuilds(env) {
     let sent = 0;
     for (const administrator of administrators.members) {
       const result = await sendDirectMessage(administrator.id, WELCOME_MESSAGE, env);
-      if (result.ok) sent++;
+      if (result.ok) {
+        sent++;
+        await saveAdminDmMessage(env, result.message_id, administrator.id, WELCOME_MESSAGE, true, null, true);
+      }
     }
     if (sent > 0) {
       const now = Math.floor(Date.now() / 1000);
@@ -2001,7 +2037,7 @@ async function sendDirectMessage(userId, content, env) {
   }
 
   try {
-    const channelResponse = await fetchWithTimeout("https://discord.com/api/v10/users/@me/channels", {
+    const channelResponse = await fetchDiscordApiWithRetry("https://discord.com/api/v10/users/@me/channels", {
       method: "POST",
       headers: {
         Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
@@ -2014,7 +2050,7 @@ async function sendDirectMessage(userId, content, env) {
     }
 
     const channel = await channelResponse.json();
-    const messageResponse = await fetchWithTimeout(`https://discord.com/api/v10/channels/${channel.id}/messages`, {
+    const messageResponse = await fetchDiscordApiWithRetry(`https://discord.com/api/v10/channels/${channel.id}/messages`, {
       method: "POST",
       headers: {
         Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`,
@@ -2052,9 +2088,11 @@ async function ensureAdminDmTables(env) {
       user_id TEXT NOT NULL,
       content TEXT NOT NULL,
       from_admin INTEGER NOT NULL,
+      is_broadcast INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
     )`
   ).run();
+  try { await env.DB.prepare(`ALTER TABLE admin_dm_messages ADD COLUMN is_broadcast INTEGER NOT NULL DEFAULT 0`).run(); } catch (e) {}
 }
 
 async function pollAdminDirectMessages(env) {
@@ -2113,7 +2151,7 @@ async function pollAdminDirectMessages(env) {
   }
 
   const { results } = await env.DB.prepare(
-    `SELECT m.user_id, m.message_id, m.content, m.from_admin, m.created_at,
+    `SELECT m.user_id, m.message_id, m.content, m.from_admin, m.is_broadcast, m.created_at,
             c.username, c.avatar
      FROM admin_dm_messages m
      LEFT JOIN admin_dm_channels c ON c.user_id = m.user_id
@@ -2126,13 +2164,15 @@ async function pollAdminDirectMessages(env) {
         user_id: message.user_id,
         username: message.username || null,
         avatar: message.avatar || null,
-        has_reply: false,
+        has_meaningful_message: false,
         unread: false,
         messages: []
       });
     }
     const conversation = conversations.get(message.user_id);
-    if (!message.from_admin) conversation.has_reply = true;
+    // 「相手からの返信」または「管理者が個別に送った返信」がある場合のみ会話として扱う。
+    // 一斉送信・参加時の自動あいさつ（is_broadcast=1）だけのスレッドは除外する。
+    if (!message.from_admin || !message.is_broadcast) conversation.has_meaningful_message = true;
     conversation.messages.push({
       message_id: message.message_id,
       content: message.content,
@@ -2141,15 +2181,13 @@ async function pollAdminDirectMessages(env) {
     });
   }
 
-  // 一度も相手から返信が来ておらず、こちらから送っただけ（あいさつメッセージ等）の
-  // スレッドは受信箱に出すと分かりにくいので除外する
-  const activeConversations = [...conversations.values()].filter(conversation => conversation.has_reply);
+  const activeConversations = [...conversations.values()].filter(conversation => conversation.has_meaningful_message);
   return { conversations: activeConversations };
 }
 
 async function getDirectMessageChannel(userId, env) {
   try {
-    const response = await fetchWithTimeout("https://discord.com/api/v10/users/@me/channels", {
+    const response = await fetchDiscordApiWithRetry("https://discord.com/api/v10/users/@me/channels", {
       method: "POST",
       headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}`, "Content-Type": "application/json" },
       body: JSON.stringify({ recipient_id: userId })
@@ -2165,18 +2203,20 @@ async function getDirectMessageChannel(userId, env) {
 async function getDiscordUserById(userId, env) {
   if (!env.DISCORD_BOT_TOKEN || !/^\d{17,20}$/.test(userId || "")) return null;
   try {
-    const response = await fetchWithTimeout(`https://discord.com/api/v10/users/${userId}`, {
+    const response = await fetchDiscordApiWithRetry(`https://discord.com/api/v10/users/${userId}`, {
       headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
     });
     if (!response.ok) return null;
     const user = await response.json();
     if (!user?.id) return null;
+    // アバターはDiscord CDNへの直リンクではなく、/admin/avatar 経由の自ドメインURLとして返す
+    // （フロント側でCDNへ直接アクセスするとContent-Security-Policyでブロックされるため）
     return {
       id: user.id,
       username: user.global_name || user.username || null,
       avatar_url: user.avatar
-        ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64`
-        : null
+        ? `/admin/avatar?user_id=${user.id}&avatar=${encodeURIComponent(user.avatar)}`
+        : "/admin/avatar?default=1"
     };
   } catch (e) {
     return null;
@@ -2186,7 +2226,7 @@ async function getDiscordUserById(userId, env) {
 async function getDirectMessages(channelId, after, env) {
   try {
     const query = after ? `?limit=100&after=${encodeURIComponent(after)}` : "?limit=100";
-    const response = await fetchWithTimeout(`https://discord.com/api/v10/channels/${channelId}/messages${query}`, {
+    const response = await fetchDiscordApiWithRetry(`https://discord.com/api/v10/channels/${channelId}/messages${query}`, {
       headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` }
     });
     if (!response.ok) return { ok: false, messages: [] };
@@ -2198,13 +2238,13 @@ async function getDirectMessages(channelId, after, env) {
   }
 }
 
-async function saveAdminDmMessage(env, messageId, userId, content, fromAdmin, timestamp = null) {
+async function saveAdminDmMessage(env, messageId, userId, content, fromAdmin, timestamp = null, isBroadcast = false) {
   if (!messageId) return false;
   const createdAt = timestamp ? Math.floor(new Date(timestamp).getTime() / 1000) : Math.floor(Date.now() / 1000);
   const result = await env.DB.prepare(
-    `INSERT OR IGNORE INTO admin_dm_messages (message_id, user_id, content, from_admin, created_at)
-     VALUES (?, ?, ?, ?, ?)`
-  ).bind(messageId, userId, content, fromAdmin ? 1 : 0, createdAt).run();
+    `INSERT OR IGNORE INTO admin_dm_messages (message_id, user_id, content, from_admin, is_broadcast, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).bind(messageId, userId, content, fromAdmin ? 1 : 0, isBroadcast ? 1 : 0, createdAt).run();
   return result?.meta?.changes === 1;
 }
 
