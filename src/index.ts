@@ -688,7 +688,6 @@ export default {
     await recordPublicStats(env);
     await notifyNewGuilds(env);
     await pollAdminDirectMessages(env);
-    await ensureSupportCommand(env);
   }
 };
 
