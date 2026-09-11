@@ -559,6 +559,38 @@ export default {
         }), true);
       }
 
+      if (url.pathname === "/admin/dm/resolve" && request.method === "POST") {
+        if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `dm-resolve:${getClientIp(request)}`)) {
+          return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
+        }
+        const session = await getSession(env, cookies["v_sess"]);
+        if (!session || session.userId !== ADMIN_DISCORD_ID || request.headers.get("X-CSRF-Token") !== session.csrfToken) {
+          return new Response(JSON.stringify({ error: "管理者権限または有効なCSRFトークンが必要です。" }), { status: 403 });
+        }
+        let body;
+        try {
+          body = await request.json();
+        } catch (e) {
+          return new Response(JSON.stringify({ error: "リクエスト形式が不正です。" }), { status: 400 });
+        }
+        if (!/^\d{17,20}$/.test(body?.user_id)) {
+          return new Response(JSON.stringify({ error: "対象ユーザーが不正です。" }), { status: 400 });
+        }
+        const resolved = body?.resolved !== false;
+        await ensureAdminDmTables(env);
+        await env.DB.prepare(
+          `INSERT INTO admin_dm_channels (user_id, channel_id, last_message_id, resolved_at, updated_at)
+           VALUES (?, '', NULL, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET resolved_at = ?, updated_at = ?`
+        ).bind(
+          body.user_id, resolved ? Math.floor(Date.now() / 1000) : null, Math.floor(Date.now() / 1000),
+          resolved ? Math.floor(Date.now() / 1000) : null, Math.floor(Date.now() / 1000)
+        ).run();
+        return withSecurityHeaders(new Response(JSON.stringify({ ok: true, resolved }), {
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        }), true);
+      }
+
       if (url.pathname === "/admin/revoke" && request.method === "POST") {
         if (!await enforceRateLimit(env.ADMIN_RATE_LIMITER, `revoke:${getClientIp(request)}`)) {
           return new Response(JSON.stringify({ error: "リクエストが多すぎます。" }), { status: 429 });
@@ -1440,6 +1472,10 @@ function renderAdminDashboard(csrfToken) {
         .dm-message-meta { color: var(--muted); font-size: 11px; margin-bottom: 4px; }
         .dm-reply { display: flex; gap: 10px; margin-top: 12px; }
         .dm-reply textarea { flex: 1; min-height: 58px; resize: vertical; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; color: var(--text); }
+        .dm-reply #dmResolveButton { background: transparent; border: 1px solid var(--line); white-space: nowrap; }
+        .dm-show-resolved { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); margin-bottom: 10px; cursor: pointer; }
+        .dm-user.resolved { opacity: .55; }
+        .dm-user-resolved-badge { color: var(--muted); font-size: 11px; margin-left: 6px; }
         .content { overflow: hidden; }
         .toolbar { display: flex; gap: 12px; justify-content: space-between; align-items: center; padding: 16px; border-bottom: 1px solid var(--line); }
         .search { width: min(420px, 100%); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px; color: var(--text); outline: none; }
@@ -1469,7 +1505,7 @@ function renderAdminDashboard(csrfToken) {
           <div class="actions"><button type="button" id="refresh">↻ 更新</button><button type="button" class="danger" id="revokeAll">一括失効（最大100件）</button></div>
         </header>
         <section class="announce-panel"><div class="section-heading"><div><div class="eyebrow">Direct message</div><h2>全サーバー管理者へお知らせ</h2></div><span class="status">所有者・管理者権限のメンバーへ DM 配信</span></div><form class="announce-form" id="announceForm"><textarea id="announcement" maxlength="${MAX_ANNOUNCEMENT_LENGTH}" placeholder="全サーバー管理者に DM する本文" required></textarea><button type="submit" id="announceButton">DMを送信</button></form><p class="status" id="announceStatus"></p></section>
-        <section class="dm-panel"><div class="section-heading"><div><div class="eyebrow">Support inbox</div><h2>管理者 DM</h2></div><span class="status" id="dmStatus">受信確認中...</span></div><div class="dm-grid"><div class="dm-users" id="dmUsers"></div><div><div class="dm-thread" id="dmThread"><div class="empty">DMを選択してください。</div></div><form class="dm-reply" id="dmReply"><textarea id="dmReplyContent" maxlength="${MAX_ANNOUNCEMENT_LENGTH}" placeholder="返信内容" required></textarea><button type="submit" id="dmReplyButton">返信</button></form></div></div></section>
+        <section class="dm-panel"><div class="section-heading"><div><div class="eyebrow">Support inbox</div><h2>管理者 DM</h2></div><span class="status" id="dmStatus">受信確認中...</span></div><label class="dm-show-resolved"><input type="checkbox" id="dmShowResolved"> 対応終了済みも表示</label><div class="dm-grid"><div class="dm-users" id="dmUsers"></div><div><div class="dm-thread" id="dmThread"><div class="empty">DMを選択してください。</div></div><form class="dm-reply" id="dmReply"><textarea id="dmReplyContent" maxlength="${MAX_ANNOUNCEMENT_LENGTH}" placeholder="返信内容" required></textarea><button type="submit" id="dmReplyButton">返信</button><button type="button" id="dmResolveButton">対応終了にする</button></form></div></div></section>
         <section class="stats"><div class="stat"><span class="stat-label">登録ユーザー</span><strong class="stat-value" id="total">-</strong></div><div class="stat"><span class="stat-label">有効な認証</span><strong class="stat-value" id="active">-</strong></div><div class="stat"><span class="stat-label">導入サーバー</span><strong class="stat-value" id="guildTotal">-</strong></div><div class="stat"><span class="stat-label">表示中</span><strong class="stat-value" id="visible">-</strong></div></section>
         <section class="guild-panel"><div class="section-heading"><div><div class="eyebrow">Discord installation</div><h2>導入サーバー</h2></div><span class="status" id="guildStatus">読み込み中...</span></div><div class="guild-grid" id="guilds"></div></section>
         <section class="member-panel" id="memberPanel"><div class="section-heading"><div><div class="eyebrow">Server members</div><h2 id="memberTitle">メンバー</h2></div><span class="status" id="memberStatus"></span></div><div class="member-grid" id="members"></div></section>
@@ -1566,10 +1602,12 @@ function renderAdminDashboard(csrfToken) {
         async function revokeUser(user, button) { if (!confirm(user.display_name + ' の認証を失効させますか？')) return; button.disabled = true; try { const response = await fetch('/admin/revoke', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ discord_id: user.discord_id, guild_id: user.guild_id }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '失効に失敗しました'); users = users.filter(item => !(item.discord_id === user.discord_id && item.guild_id === user.guild_id)); $('total').textContent = users.length; $('active').textContent = users.filter(item => item.expires_at * 1000 > Date.now()).length; render(); } catch (error) { alert(error.message); button.disabled = false; } }
         let dmConversations = [];
         let selectedDmUserId = null;
-        function renderDmThread() { const conversation = dmConversations.find(item => item.user_id === selectedDmUserId); $('dmThread').replaceChildren(); if (!conversation) { $('dmThread').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: 'DMを選択してください。' })); return; } conversation.messages.forEach(message => { const item = document.createElement('div'); item.className = 'dm-message' + (message.from_admin ? ' admin' : ''); const meta = document.createElement('div'); meta.className = 'dm-message-meta'; meta.textContent = (message.from_admin ? '管理者' : (conversation.username || '相手')) + ' · ' + new Date(message.created_at * 1000).toLocaleString('ja-JP'); const content = document.createElement('div'); content.textContent = message.content; item.append(meta, content); $('dmThread').append(item); }); $('dmThread').scrollTop = $('dmThread').scrollHeight; }
-        function renderDmUsers() { $('dmUsers').replaceChildren(); dmConversations.forEach(conversation => { const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-user' + (conversation.user_id === selectedDmUserId ? ' selected' : ''); const avatar = document.createElement('img'); avatar.className = 'dm-user-avatar'; avatar.src = conversation.avatar || '/admin/avatar?default=1'; avatar.alt = ''; const info = document.createElement('div'); info.className = 'dm-user-info'; const name = document.createElement('span'); name.className = 'dm-user-name'; name.textContent = (conversation.username || '不明なユーザー') + (conversation.unread ? ' · 新着' : ''); const id = document.createElement('span'); id.className = 'dm-user-id'; id.textContent = conversation.user_id; info.append(name, id); button.append(avatar, info); button.onclick = () => { selectedDmUserId = conversation.user_id; renderDmUsers(); renderDmThread(); }; $('dmUsers').append(button); }); if (!dmConversations.length) $('dmUsers').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: '受信した DM はありません。' })); }
+        function renderDmThread() { const conversation = dmConversations.find(item => item.user_id === selectedDmUserId); $('dmThread').replaceChildren(); $('dmResolveButton').disabled = !conversation; $('dmResolveButton').textContent = conversation?.resolved ? '対応中に戻す' : '対応終了にする'; if (!conversation) { $('dmThread').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: 'DMを選択してください。' })); return; } conversation.messages.forEach(message => { const item = document.createElement('div'); item.className = 'dm-message' + (message.from_admin ? ' admin' : ''); const meta = document.createElement('div'); meta.className = 'dm-message-meta'; meta.textContent = (message.from_admin ? '管理者' : (conversation.username || '相手')) + ' · ' + new Date(message.created_at * 1000).toLocaleString('ja-JP'); const content = document.createElement('div'); content.textContent = message.content; item.append(meta, content); $('dmThread').append(item); }); $('dmThread').scrollTop = $('dmThread').scrollHeight; }
+        function renderDmUsers() { $('dmUsers').replaceChildren(); const showResolved = $('dmShowResolved').checked; const visibleConversations = dmConversations.filter(conversation => showResolved || !conversation.resolved); visibleConversations.forEach(conversation => { const button = document.createElement('button'); button.type = 'button'; button.className = 'dm-user' + (conversation.user_id === selectedDmUserId ? ' selected' : '') + (conversation.resolved ? ' resolved' : ''); const avatar = document.createElement('img'); avatar.className = 'dm-user-avatar'; avatar.src = conversation.avatar || '/admin/avatar?default=1'; avatar.alt = ''; const info = document.createElement('div'); info.className = 'dm-user-info'; const name = document.createElement('span'); name.className = 'dm-user-name'; name.textContent = (conversation.username || '不明なユーザー') + (conversation.unread ? ' · 新着' : ''); if (conversation.resolved) { const badge = document.createElement('span'); badge.className = 'dm-user-resolved-badge'; badge.textContent = '対応済み'; name.append(badge); } const id = document.createElement('span'); id.className = 'dm-user-id'; id.textContent = conversation.user_id; info.append(name, id); button.append(avatar, info); button.onclick = () => { selectedDmUserId = conversation.user_id; renderDmUsers(); renderDmThread(); }; $('dmUsers').append(button); }); if (!visibleConversations.length) $('dmUsers').append(Object.assign(document.createElement('div'), { className: 'empty', textContent: dmConversations.length ? '対応終了済みのみです。' : '受信した DM はありません。' })); }
         async function loadDmInbox() { try { const response = await fetch('/admin/dm/inbox', { headers: { 'X-CSRF-Token': csrfToken } }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DMの取得に失敗しました'); dmConversations = data.conversations || []; if (!dmConversations.some(item => item.user_id === selectedDmUserId)) selectedDmUserId = dmConversations[0]?.user_id || null; renderDmUsers(); renderDmThread(); $('dmStatus').textContent = '最終確認: ' + new Date().toLocaleTimeString('ja-JP'); } catch (error) { $('dmStatus').textContent = error.message; } }
         $('dmReply').addEventListener('submit', async (event) => { event.preventDefault(); if (!selectedDmUserId) return; const content = $('dmReplyContent').value.trim(); if (!content) return; $('dmReplyButton').disabled = true; try { const response = await fetch('/admin/dm/reply', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ user_id: selectedDmUserId, content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '返信に失敗しました'); $('dmReplyContent').value = ''; await loadDmInbox(); } catch (error) { alert(error.message); } finally { $('dmReplyButton').disabled = false; } });
+        $('dmResolveButton').addEventListener('click', async () => { if (!selectedDmUserId) return; const conversation = dmConversations.find(item => item.user_id === selectedDmUserId); const nextResolved = !conversation?.resolved; $('dmResolveButton').disabled = true; try { const response = await fetch('/admin/dm/resolve', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ user_id: selectedDmUserId, resolved: nextResolved }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || '更新に失敗しました'); await loadDmInbox(); } catch (error) { alert(error.message); } finally { $('dmResolveButton').disabled = false; } });
+        $('dmShowResolved').addEventListener('change', renderDmUsers);
         $('announceForm').addEventListener('submit', async (event) => { event.preventDefault(); const content = $('announcement').value.trim(); if (!content || !confirm('全サーバー管理者へ DM を送信しますか？')) return; $('announceButton').disabled = true; $('announceStatus').textContent = '送信中...'; try { const response = await fetch('/admin/announce', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ content }) }); const data = await response.json(); if (!response.ok) throw new Error(data.error || 'DM送信に失敗しました'); const failed = data.results.filter(result => !result.ok); $('announceStatus').textContent = '完了: ' + data.sent + 'サーバー成功 / ' + data.total + 'サーバー中' + failed.length + 'サーバー失敗' + (failed.length ? '。詳細はブラウザの開発者コンソールを確認してください。' : ''); if (failed.length) console.warn('DM送信失敗', failed); } catch (error) { $('announceStatus').textContent = error.message; } finally { $('announceButton').disabled = false; } });
         $('search').addEventListener('input', render); $('refresh').addEventListener('click', () => { load(); loadGuilds(); loadDmInbox(); }); $('revokeAll').addEventListener('click', async () => { if (!confirm('有効な認証を最大100件まで失効させ、保存データを削除します。続行しますか？')) return; $('revokeAll').disabled = true; try { const response = await fetch('/admin/unlink-all', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } }); const message = await response.text(); if (!response.ok) throw new Error(message); alert(message); await load(); await loadGuilds(); } catch (error) { alert(error.message); } finally { $('revokeAll').disabled = false; } }); load(); loadGuilds(); loadDmInbox();
       </script>
@@ -2076,12 +2114,14 @@ async function ensureAdminDmTables(env) {
       last_message_id TEXT,
       username TEXT,
       avatar TEXT,
+      resolved_at INTEGER,
       updated_at INTEGER NOT NULL
     )`
   ).run();
   // 旧バージョンで作成済みのテーブルにも列を追加する（既に存在する場合はエラーを無視）
   try { await env.DB.prepare(`ALTER TABLE admin_dm_channels ADD COLUMN username TEXT`).run(); } catch (e) {}
   try { await env.DB.prepare(`ALTER TABLE admin_dm_channels ADD COLUMN avatar TEXT`).run(); } catch (e) {}
+  try { await env.DB.prepare(`ALTER TABLE admin_dm_channels ADD COLUMN resolved_at INTEGER`).run(); } catch (e) {}
   await env.DB.prepare(
     `CREATE TABLE IF NOT EXISTS admin_dm_messages (
       message_id TEXT PRIMARY KEY,
@@ -2110,12 +2150,28 @@ async function pollAdminDirectMessages(env) {
     const channel = await getDirectMessageChannel(userId, env);
     if (!channel.ok) continue;
     const cursor = await env.DB.prepare(
-      "SELECT last_message_id, username, avatar FROM admin_dm_channels WHERE user_id = ?"
+      "SELECT last_message_id, username, avatar, resolved_at FROM admin_dm_channels WHERE user_id = ?"
     ).bind(userId).first();
     const isInitialSync = !cursor?.last_message_id;
-    const messages = await getDirectMessages(channel.channel_id, cursor?.last_message_id, env);
-    if (!messages.ok) continue;
 
+    // Discord APIは1リクエストにつき最大100件しか返さないため、未同期分が100件を
+    // 超えている場合は取りこぼしてしまう。取得件数が100件（＝まだ続きがある可能性）の
+    // 間はページングして全件取得する。
+    let cursorMessageId = cursor?.last_message_id || null;
+    let allMessages = [];
+    let pageFailed = false;
+    while (true) {
+      const page = await getDirectMessages(channel.channel_id, cursorMessageId, env);
+      if (!page.ok) { pageFailed = allMessages.length === 0; break; }
+      if (page.messages.length === 0) break;
+      allMessages = allMessages.concat(page.messages);
+      cursorMessageId = page.messages[page.messages.length - 1].id;
+      if (page.messages.length < 100) break;
+    }
+    if (pageFailed) continue;
+    const messages = { ok: true, messages: allMessages };
+
+    let shouldReopen = false;
     for (const message of messages.messages) {
       // Bot自身が送信したメッセージ（自動あいさつ・管理者からの返信など）かどうかを判定する。
       // 旧実装は message.author.id === ADMIN_DISCORD_ID で判定していたが、
@@ -2124,6 +2180,7 @@ async function pollAdminDirectMessages(env) {
       const isFromBot = message.author?.bot === true;
       await saveAdminDmMessage(env, message.id, userId, message.content || "", isFromBot, message.timestamp);
       if (!isInitialSync && !isFromBot) {
+        shouldReopen = true;
         await sendDirectMessage(ADMIN_DISCORD_ID, `【管理者 DM 受信】\n送信者: <@${userId}>\n\n${message.content || "(本文なし)"}`, env);
       }
     }
@@ -2140,22 +2197,23 @@ async function pollAdminDirectMessages(env) {
     }
 
     const latestMessageId = messages.messages[messages.messages.length - 1]?.id || cursor?.last_message_id || null;
+    const resolvedAt = shouldReopen ? null : (cursor?.resolved_at ?? null);
     await env.DB.prepare(
-      `INSERT INTO admin_dm_channels (user_id, channel_id, last_message_id, username, avatar, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(user_id) DO UPDATE SET channel_id = ?, last_message_id = ?, username = ?, avatar = ?, updated_at = ?`
+      `INSERT INTO admin_dm_channels (user_id, channel_id, last_message_id, username, avatar, resolved_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET channel_id = ?, last_message_id = ?, username = ?, avatar = ?, resolved_at = ?, updated_at = ?`
     ).bind(
-      userId, channel.channel_id, latestMessageId, username, avatar, Math.floor(Date.now() / 1000),
-      channel.channel_id, latestMessageId, username, avatar, Math.floor(Date.now() / 1000)
+      userId, channel.channel_id, latestMessageId, username, avatar, resolvedAt, Math.floor(Date.now() / 1000),
+      channel.channel_id, latestMessageId, username, avatar, resolvedAt, Math.floor(Date.now() / 1000)
     ).run();
   }
 
   const { results } = await env.DB.prepare(
     `SELECT m.user_id, m.message_id, m.content, m.from_admin, m.is_broadcast, m.created_at,
-            c.username, c.avatar
+            c.username, c.avatar, c.resolved_at
      FROM admin_dm_messages m
      LEFT JOIN admin_dm_channels c ON c.user_id = m.user_id
-     ORDER BY m.created_at ASC LIMIT 1000`
+     ORDER BY m.created_at ASC`
   ).all();
   const conversations = new Map();
   for (const message of results || []) {
@@ -2164,6 +2222,7 @@ async function pollAdminDirectMessages(env) {
         user_id: message.user_id,
         username: message.username || null,
         avatar: message.avatar || null,
+        resolved: Boolean(message.resolved_at),
         has_meaningful_message: false,
         unread: false,
         messages: []
