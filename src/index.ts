@@ -1270,7 +1270,7 @@ function withSecurityHeaders(response, noStore = false) {
   response.headers.set("X-Content-Type-Options", "nosniff");
   response.headers.set("X-Frame-Options", "DENY");
   response.headers.set("Referrer-Policy", "no-referrer");
-  response.headers.set("Content-Security-Policy", "default-src 'self'; img-src 'self'; frame-ancestors 'none'; script-src 'self' https://js.hcaptcha.com 'unsafe-inline'; frame-src https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com");
+  response.headers.set("Content-Security-Policy", "default-src 'self'; img-src 'self' https://cdn.discordapp.com; frame-ancestors 'none'; script-src 'self' https://js.hcaptcha.com 'unsafe-inline'; frame-src https://*.hcaptcha.com; style-src 'self' 'unsafe-inline'; connect-src 'self' https://hcaptcha.com https://*.hcaptcha.com");
   if (noStore) response.headers.set("Cache-Control", "no-store");
   return response;
 }
